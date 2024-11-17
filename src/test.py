@@ -31,7 +31,7 @@ df = df.reset_index(drop=True)
 # 2. Parameter Definitions
 # ============================
 
-WINDOW_SIZE = 2         # Number of time steps in each window
+WINDOW_SIZE = 2        # Number of time steps in each window
 INPUT_WINDOWS = 3      # Number of input windows to consider for prediction
 PREDICT_WINDOW = 1     # Number of windows to predict
 BATCH_SIZE = 128       # Batch size for training and validation

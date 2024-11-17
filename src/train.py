@@ -33,8 +33,8 @@ df = df.reset_index(drop=True)
 # ============================
 
 WINDOW_SIZE = 24         # Number of time steps in each window
-INPUT_WINDOWS = 3       # Number of input windows to consider for prediction
-PREDICT_WINDOW = 1      # Number of windows to predict
+INPUT_WINDOWS = 3        # Number of input windows to consider for prediction
+PREDICT_WINDOW = 1       # Number of windows to predict
 BATCH_SIZE = 128         # Batch size for training and validation
 
 # ============================
@@ -100,7 +100,8 @@ class UserDataset(Dataset):
         user_id = sample['user_id']
         bpm_target_original = torch.tensor(sample['bpm_target_original'], dtype=torch.float32)
         steps_target_original = torch.tensor(sample['steps_target_original'], dtype=torch.float32)
-        return bpm_input, steps_input, bpm_target, steps_target, user_id, bpm_target_original, steps_target_original
+        datetime = sample.get('datetime', None)  # Handle if datetime is not present
+        return bpm_input, steps_input, bpm_target, steps_target, user_id, bpm_target_original, steps_target_original, datetime
 
 def create_data_samples(df):
     """
@@ -127,7 +128,8 @@ def create_data_samples(df):
                 'steps_target': target_window['steps_scaled'].values,
                 'bpm_target_original': target_window['bpm'].values,
                 'steps_target_original': target_window['steps'].values,
-                'user_id': user_id
+                'user_id': user_id,
+                'datetime': target_window['datetime'].values[0]  # Add datetime
             })
     return data_samples
 
@@ -204,7 +206,8 @@ def collate_fn(batch):
     user_ids = [s[4] for s in batch]
     bpm_targets_original = [s[5] for s in batch]
     steps_targets_original = [s[6] for s in batch]
-    return bpm_inputs, steps_inputs, bpm_targets, steps_targets, user_ids, bpm_targets_original, steps_targets_original
+    datetimes = [s[7] for s in batch]  # Add datetimes
+    return bpm_inputs, steps_inputs, bpm_targets, steps_targets, user_ids, bpm_targets_original, steps_targets_original, datetimes
 
 # Create DataLoaders
 train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=collate_fn)
@@ -281,26 +284,26 @@ class ForecastingModel(nn.Module):
         """
         Forward pass for the forecasting model.
         """
-            # Reshape BPM input: [batch_size, INPUT_WINDOWS, WINDOW_SIZE] -> [batch_size, 1, INPUT_WINDOWS * WINDOW_SIZE]
-        bpm_seq = bpm_input.view(bpm_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 6]
+        # Reshape BPM input: [batch_size, INPUT_WINDOWS, WINDOW_SIZE] -> [batch_size, 1, INPUT_WINDOWS * WINDOW_SIZE]
+        bpm_seq = bpm_input.view(bpm_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 72]
         
         # CNN Encoder for BPM
-        bpm_cnn_output = self.bpm_cnn(bpm_seq)  # Shape: [B, 64, 6]
-        bpm_cnn_output = bpm_cnn_output.permute(0, 2, 1)  # Shape: [B, 6, 64]
+        bpm_cnn_output = self.bpm_cnn(bpm_seq)  # Shape: [B, 64, 72]
+        bpm_cnn_output = bpm_cnn_output.permute(0, 2, 1)  # Shape: [B, 72, 64]
         
         # LSTM Encoder for BPM
-        bpm_lstm_output, _ = self.bpm_lstm(bpm_cnn_output)  # Shape: [B, 6, 128]
+        bpm_lstm_output, _ = self.bpm_lstm(bpm_cnn_output)  # Shape: [B, 72, 128]
         bpm_hidden = bpm_lstm_output[:, -1, :]  # Shape: [B, 128]
         
-        # Reshape Steps input similarly: [B, 1, 6]
-        steps_seq = steps_input.view(steps_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 6]
+        # Reshape Steps input similarly: [B, 1, 72]
+        steps_seq = steps_input.view(steps_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 72]
         
         # CNN Encoder for Steps
-        steps_cnn_output = self.steps_cnn(steps_seq)  # Shape: [B, 64, 6]
-        steps_cnn_output = steps_cnn_output.permute(0, 2, 1)  # Shape: [B, 6, 64]
+        steps_cnn_output = self.steps_cnn(steps_seq)  # Shape: [B, 64, 72]
+        steps_cnn_output = steps_cnn_output.permute(0, 2, 1)  # Shape: [B, 72, 64]
         
         # LSTM Encoder for Steps
-        steps_lstm_output, _ = self.steps_lstm(steps_cnn_output)  # Shape: [B, 6, 128]
+        steps_lstm_output, _ = self.steps_lstm(steps_cnn_output)  # Shape: [B, 72, 128]
         steps_hidden = steps_lstm_output[:, -1, :]  # Shape: [B, 128]
         
         # Concatenate the hidden states from BPM and Steps
@@ -310,8 +313,8 @@ class ForecastingModel(nn.Module):
         fused_features = self.fc(combined_features)  # Shape: [B, 128]
         
         # Separate Decoders
-        bpm_pred = self.bpm_decoder(fused_features)    # Shape: [B, WINDOW_SIZE]
-        steps_pred = self.steps_decoder(fused_features) # Shape: [B, WINDOW_SIZE]
+        bpm_pred = self.bpm_decoder(fused_features)    # Shape: [B, 24]
+        steps_pred = self.steps_decoder(fused_features) # Shape: [B, 24]
         
         return bpm_pred, steps_pred
 
@@ -361,6 +364,9 @@ stats = {
     'avg_steps_error': []
 }
 
+# Initialize lists to store validation errors and related information
+validation_errors = []
+
 for epoch in range(num_epochs):
     if early_stop:
         break
@@ -370,7 +376,7 @@ for epoch in range(num_epochs):
     # ---------------------
     model.train()
     epoch_loss = 0.0
-    for bpm_input, steps_input, bpm_target, steps_target, _, _, _ in train_loader:
+    for bpm_input, steps_input, bpm_target, steps_target, _, _, _, _ in train_loader:
         optimizer.zero_grad()
         
         # Move tensors to the device
@@ -404,8 +410,12 @@ for epoch in range(num_epochs):
     val_loss = 0.0
     total_bpm_error = 0.0
     total_steps_error = 0.0
+    
+    # Reset validation errors list at each epoch
+    validation_errors_epoch = []
+    
     with torch.no_grad():
-        for bpm_input, steps_input, bpm_target, steps_target, user_id, bpm_target_original, steps_target_original in val_loader:
+        for bpm_input, steps_input, bpm_target, steps_target, user_id, bpm_target_original, steps_target_original, datetimes in val_loader:
             # Move tensors to the device
             bpm_input = bpm_input.to(device)
             steps_input = steps_input.to(device)
@@ -439,10 +449,22 @@ for epoch in range(num_epochs):
                 steps_error = np.mean(np.abs(steps_pred_unscaled - steps_target_unscaled))
                 total_bpm_error += bpm_error
                 total_steps_error += steps_error
+                
+                # Store detailed error information
+                validation_errors_epoch.append({
+                    'user_id': uid,
+                    'bpm_error': bpm_error,
+                    'steps_error': steps_error,
+                    'bpm_pred': bpm_pred_unscaled,
+                    'steps_pred': steps_pred_unscaled,
+                    'bpm_true': bpm_target_unscaled,
+                    'steps_true': steps_target_unscaled,
+                    'bpm_input': bpm_input.cpu().numpy()[i],   # Shape: [INPUT_WINDOWS, WINDOW_SIZE]
+                    'steps_input': steps_input.cpu().numpy()[i], # Shape: [INPUT_WINDOWS, WINDOW_SIZE]
+                    'datetime': datetimes[i]
+                })
     
-    # ---------------------
-    # Calculate Average Losses and Errors
-    # ---------------------
+    # Aggregate errors
     avg_train_loss = epoch_loss / len(train_loader)
     avg_val_loss = val_loss / len(val_loader)
     avg_bpm_error = total_bpm_error / len(val_loader.dataset)
@@ -454,6 +476,9 @@ for epoch in range(num_epochs):
     stats['val_loss'].append(avg_val_loss)
     stats['avg_bpm_error'].append(avg_bpm_error)
     stats['avg_steps_error'].append(avg_steps_error)
+    
+    # Append epoch's validation errors to the main list
+    validation_errors.extend(validation_errors_epoch)
     
     # ---------------------
     # Check for Improvement
@@ -489,7 +514,7 @@ os.makedirs(results_dir, exist_ok=True)
 stats_df = pd.DataFrame(stats)
 
 # Save DataFrame
-stats_df.to_csv(os.path.join(results_dir, "stats.csv"))
+stats_df.to_csv(os.path.join(results_dir, "stats.csv"), index=False)
 
 # Plot and save Training and Validation Loss
 plt.figure(figsize=(10, 6))
@@ -523,3 +548,98 @@ plt.savefig(os.path.join(results_dir, 'steps_error_per_epoch.png'))
 plt.show()
 
 print(f"Training complete. Figures saved in '{results_dir}'.")
+
+# ============================
+# 11. Analyze Validation Errors
+# ============================
+
+# Convert validation_errors to a DataFrame
+validation_errors_df = pd.DataFrame(validation_errors)
+
+# Calculate total error (BPM + Steps)
+validation_errors_df['total_error'] = validation_errors_df['bpm_error'] + validation_errors_df['steps_error']
+
+# Aggregate errors per user by computing the mean total error
+user_error_df = validation_errors_df.groupby('user_id')['total_error'].mean().reset_index()
+
+# Sort users by total_error
+user_error_df_sorted = user_error_df.sort_values(by='total_error', ascending=True)
+
+# Select top 10 best and top 10 worst users
+top_N = 10  # Number of users in each category
+best_users = user_error_df_sorted.head(top_N)
+worst_users = user_error_df_sorted.tail(top_N)
+
+print(f"Selected Best Users:\n{best_users}\n")
+print(f"Selected Worst Users:\n{worst_users}\n")
+
+# Create a directory to save the analysis plots
+analysis_dir = 'results/train/analysis'
+os.makedirs(analysis_dir, exist_ok=True)
+
+# Function to plot predictions without input windows
+def plot_prediction_user(user_id, user_samples, index, type):
+    """
+    Plots the true vs predicted BPM and Steps for a user.
+    """
+    import matplotlib.pyplot as plt
+
+    # Iterate over user's samples and plot them
+    for i, sample in enumerate(user_samples):
+        bpm_pred = sample['bpm_pred']
+        steps_pred = sample['steps_pred']
+        bpm_true = sample['bpm_true']
+        steps_true = sample['steps_true']
+        datetime = sample['datetime']
+
+        # Create subplots
+        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle(f'User ID: {user_id} | Sample {i+1} | Datetime: {datetime}', fontsize=16)
+
+        # Plot BPM Prediction vs True
+        axs[0, 0].plot(range(WINDOW_SIZE), bpm_true, label='True BPM', marker='o')
+        axs[0, 0].plot(range(WINDOW_SIZE), bpm_pred, label='Predicted BPM', marker='x')
+        axs[0, 0].set_title('BPM Prediction vs True')
+        axs[0, 0].legend()
+
+        # Plot Steps Prediction vs True
+        axs[0, 1].plot(range(WINDOW_SIZE), steps_true, label='True Steps', marker='o')
+        axs[0, 1].plot(range(WINDOW_SIZE), steps_pred, label='Predicted Steps', marker='x', color='orange')
+        axs[0, 1].set_title('Steps Prediction vs True')
+        axs[0, 1].legend()
+
+        # Plot BPM Absolute Error
+        axs[1, 0].bar(range(WINDOW_SIZE), np.abs(bpm_true - bpm_pred))
+        axs[1, 0].set_title('BPM Absolute Error')
+
+        # Plot Steps Absolute Error
+        axs[1, 1].bar(range(WINDOW_SIZE), np.abs(steps_true - steps_pred), color='orange')
+        axs[1, 1].set_title('Steps Absolute Error')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot_filename = os.path.join(analysis_dir, f'{type}_user_{user_id}_sample_{i+1}.png')
+        plt.savefig(plot_filename)
+        plt.close()
+
+        print(f'Saved plot for User {user_id}, Sample {i+1} at {plot_filename}')
+
+# Plot predictions for best and worst users
+for idx, row in best_users.iterrows():
+    user_id = row['user_id']
+    # Get all samples for this user
+    user_samples = validation_errors_df[validation_errors_df['user_id'] == user_id].to_dict(orient='records')
+    # Limit the number of samples to plot per user if needed
+    # For example, plot the first 2 samples
+    samples_to_plot = user_samples[:2]  # Adjust as needed
+    for sample_idx, sample in enumerate(samples_to_plot):
+        plot_prediction_user(user_id, [sample], sample_idx, "best")
+
+for idx, row in worst_users.iterrows():
+    user_id = row['user_id']
+    # Get all samples for this user
+    user_samples = validation_errors_df[validation_errors_df['user_id'] == user_id].to_dict(orient='records')
+    # Limit the number of samples to plot per user if needed
+    # For example, plot the first 2 samples
+    samples_to_plot = user_samples[:2]  # Adjust as needed
+    for sample_idx, sample in enumerate(samples_to_plot):
+        plot_prediction_user(user_id, [sample], sample_idx, "worst")
