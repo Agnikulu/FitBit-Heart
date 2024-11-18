@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch import nn
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler  # Changed from StandardScaler
 from sklearn.model_selection import train_test_split
 import warnings
 from collections import defaultdict
@@ -32,49 +32,48 @@ df = df.reset_index(drop=True)
 # 2. Parameter Definitions
 # ============================
 
-WINDOW_SIZE = 24         # Number of time steps in each window
+WINDOW_SIZE = 4          # Number of time steps in each window
 INPUT_WINDOWS = 3        # Number of input windows to consider for prediction
 PREDICT_WINDOW = 1       # Number of windows to predict
 BATCH_SIZE = 128         # Batch size for training and validation
 
 # ============================
-# 3. Data Normalization
+# 3. Data Normalization with RobustScaler
 # ============================
 
 user_scalers = {}
 
 def scale_per_user(group):
     """
-    Applies StandardScaler to BPM and Steps data for each user.
+    Applies RobustScaler to BPM and Steps data for each user.
     Stores scaler parameters for inverse transformations.
     """
     user_id = group.name
-    scaler_bpm = StandardScaler()
-    scaler_steps = StandardScaler()
+    scaler_bpm = RobustScaler()
+    scaler_steps = RobustScaler()
     group['bpm_scaled'] = scaler_bpm.fit_transform(group['bpm'].values.reshape(-1,1)).flatten()
     group['steps_scaled'] = scaler_steps.fit_transform(group['steps'].values.reshape(-1,1)).flatten()
     user_scalers[user_id] = {
-        'bpm_mean': scaler_bpm.mean_[0],
+        'bpm_median': scaler_bpm.center_[0],
         'bpm_scale': scaler_bpm.scale_[0],
-        'steps_mean': scaler_steps.mean_[0],
+        'steps_median': scaler_steps.center_[0],
         'steps_scale': scaler_steps.scale_[0]
     }
     return group
 
-# Apply scaling per user
+# Apply scaling per user with RobustScaler
 df = df.groupby('id').apply(scale_per_user).reset_index(drop=True)
 
-# Function to inverse transform scaled data
 def inverse_transform(user_id, bpm_scaled, steps_scaled):
     """
     Reverts scaled BPM and Steps data back to original scale using stored scaler parameters.
     """
-    bpm_mean = user_scalers[user_id]['bpm_mean']
+    bpm_median = user_scalers[user_id]['bpm_median']
     bpm_scale = user_scalers[user_id]['bpm_scale']
-    steps_mean = user_scalers[user_id]['steps_mean']
+    steps_median = user_scalers[user_id]['steps_median']
     steps_scale = user_scalers[user_id]['steps_scale']
-    bpm_original = bpm_scaled * bpm_scale + bpm_mean
-    steps_original = steps_scaled * steps_scale + steps_mean
+    bpm_original = bpm_scaled * bpm_scale + bpm_median
+    steps_original = steps_scaled * steps_scale + steps_median
     return bpm_original, steps_original
 
 # ============================
@@ -330,7 +329,7 @@ model = ForecastingModel().to(device)
 # ============================
 
 # Define the loss function and optimizer
-criterion = nn.L1Loss()  # Using Mean Absolute Error (MAE) Loss
+criterion = nn.MSELoss()  # Changed from nn.L1Loss() to nn.MSELoss() for Mean Squared Error Loss
 
 # Initialize the optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # Added weight_decay for regularization
@@ -459,8 +458,6 @@ for epoch in range(num_epochs):
                     'steps_pred': steps_pred_unscaled,
                     'bpm_true': bpm_target_unscaled,
                     'steps_true': steps_target_unscaled,
-                    'bpm_input': bpm_input.cpu().numpy()[i],   # Shape: [INPUT_WINDOWS, WINDOW_SIZE]
-                    'steps_input': steps_input.cpu().numpy()[i], # Shape: [INPUT_WINDOWS, WINDOW_SIZE]
                     'datetime': datetimes[i]
                 })
     
@@ -578,7 +575,7 @@ analysis_dir = 'results/train/analysis'
 os.makedirs(analysis_dir, exist_ok=True)
 
 # Function to plot predictions without input windows
-def plot_prediction_user(user_id, user_samples, index, type):
+def plot_prediction_user(user_id, user_samples, index, category):
     """
     Plots the true vs predicted BPM and Steps for a user.
     """
@@ -617,29 +614,52 @@ def plot_prediction_user(user_id, user_samples, index, type):
         axs[1, 1].set_title('Steps Absolute Error')
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plot_filename = os.path.join(analysis_dir, f'{type}_user_{user_id}_sample_{i+1}.png')
+        plot_filename = os.path.join(analysis_dir, f'{category}_user_{user_id}_sample_{i+1}.png')
         plt.savefig(plot_filename)
         plt.close()
 
-        print(f'Saved plot for User {user_id}, Sample {i+1} at {plot_filename}')
+        print(f'Saved plot for {category} User {user_id}, Sample {i+1} at {plot_filename}')
 
-# Plot predictions for best and worst users
+# Plot predictions for best users
 for idx, row in best_users.iterrows():
     user_id = row['user_id']
     # Get all samples for this user
     user_samples = validation_errors_df[validation_errors_df['user_id'] == user_id].to_dict(orient='records')
     # Limit the number of samples to plot per user if needed
-    # For example, plot the first 2 samples
     samples_to_plot = user_samples[:2]  # Adjust as needed
     for sample_idx, sample in enumerate(samples_to_plot):
         plot_prediction_user(user_id, [sample], sample_idx, "best")
 
+# Plot predictions for worst users
 for idx, row in worst_users.iterrows():
     user_id = row['user_id']
     # Get all samples for this user
     user_samples = validation_errors_df[validation_errors_df['user_id'] == user_id].to_dict(orient='records')
     # Limit the number of samples to plot per user if needed
-    # For example, plot the first 2 samples
     samples_to_plot = user_samples[:2]  # Adjust as needed
     for sample_idx, sample in enumerate(samples_to_plot):
         plot_prediction_user(user_id, [sample], sample_idx, "worst")
+
+# ============================
+# 12. Identify and Visualize Patterns in Errors
+# ============================
+
+# With 'datetime' included, you can analyze errors based on time.
+# For example, plot errors over different times of day.
+
+# Convert 'datetime' to pandas datetime if not already
+validation_errors_df['datetime'] = pd.to_datetime(validation_errors_df['datetime'])
+
+# Add hour of day
+validation_errors_df['hour'] = validation_errors_df['datetime'].dt.hour
+
+# Plot average error by hour
+plt.figure(figsize=(12, 6))
+plt.scatter(validation_errors_df['hour'], validation_errors_df['total_error'], alpha=0.5)
+plt.xlabel('Hour of Day')
+plt.ylabel('Total Error (BPM + Steps)')
+plt.title('Total Prediction Error by Hour of Day')
+plt.savefig(os.path.join(analysis_dir, 'error_by_hour.png'))
+plt.close()
+print(f'Saved error by hour plot at {os.path.join(analysis_dir, "error_by_hour.png")}')
+
