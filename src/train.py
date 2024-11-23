@@ -6,6 +6,7 @@ from torch import nn
 from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.utils.class_weight import compute_class_weight
 import warnings
 from collections import defaultdict
 import os
@@ -25,17 +26,14 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 # Parameters
-WINDOW_SIZE = 24          # Number of time steps in each window
-INPUT_WINDOWS = 3         # Number of input windows to consider for prediction 
+WINDOW_SIZE = 6          # Number of time steps in each window
+INPUT_WINDOWS = 4         # Number of input windows to consider for prediction 
 PREDICT_WINDOW = 1        # Number of windows to predict
-BATCH_SIZE = 64           # Batch size for training and validation
+BATCH_SIZE = 128          # Batch size for training and validation
 NUM_EPOCHS = 150          # Number of training epochs
 PATIENCE = 25             # Patience for early stopping
 LEARNING_RATE = 0.001     # Learning rate for optimizer
 WEIGHT_DECAY = 1e-5       # Weight decay for optimizer
-SPIKE_THRESH = 1.5        # Threshold for spike detection (not used with percentile-based method)
-SPIKE_WEIGHT = None       # We'll compute SPIKE_WEIGHT based on class imbalance
-SPIKE_WEIGHT_CAP = 5.0    # Cap for SPIKE_WEIGHT to prevent overcompensation
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Device configuration
 
 # Directories
@@ -206,16 +204,6 @@ print(f"Number of spike samples: {int(num_spikes)}")
 print(f"Number of no-spike samples: {int(num_no_spikes)}")
 print(f"Spike sample ratio: {num_spikes / len(total_spike_labels):.4f}")
 
-# Calculate SPIKE_WEIGHT based on class imbalance
-spike_ratio = num_spikes / len(total_spike_labels)
-no_spike_ratio = num_no_spikes / len(total_spike_labels)
-
-# Set SPIKE_WEIGHT to inverse of spike ratio
-SPIKE_WEIGHT = no_spike_ratio / spike_ratio
-# Cap SPIKE_WEIGHT to prevent overcompensation
-SPIKE_WEIGHT = min(SPIKE_WEIGHT, SPIKE_WEIGHT_CAP)
-print(f"Computed SPIKE_WEIGHT (capped): {SPIKE_WEIGHT:.2f}")
-
 # ============================
 # 6. Train-Validation Split
 # ============================
@@ -227,34 +215,6 @@ train_user_ids, val_user_ids = train_test_split(unique_user_ids, test_size=0.2, 
 # Filter data_samples based on user IDs
 train_samples = [sample for sample in data_samples if sample['user_id'] in train_user_ids]
 val_samples = [sample for sample in data_samples if sample['user_id'] in val_user_ids]
-
-# ============================
-# 7. Oversample Spike Samples in Training Data
-# ============================
-
-from sklearn.utils import resample
-
-def balance_dataset(train_samples):
-    """
-    Balances the training dataset by oversampling spike samples.
-    """
-    spike_samples = [sample for sample in train_samples if sample['spike_labels'].sum() > 0]
-    non_spike_samples = [sample for sample in train_samples if sample['spike_labels'].sum() == 0]
-    print(f"Original spike samples: {len(spike_samples)}, non-spike samples: {len(non_spike_samples)}")
-    
-    # Oversample spike samples to match the number of non-spike samples
-    spike_samples_oversampled = resample(spike_samples,
-                                         replace=True,
-                                         n_samples=len(non_spike_samples),
-                                         random_state=SEED)
-    
-    # Combine and shuffle
-    train_samples_balanced = spike_samples_oversampled + non_spike_samples
-    random.shuffle(train_samples_balanced)
-    return train_samples_balanced
-
-# Balance the training dataset
-train_samples_balanced = balance_dataset(train_samples)
 
 # ============================
 # 7A. DataLoader Setup
@@ -315,8 +275,8 @@ class PerUserBatchSampler(Sampler):
         return len(self.batches)
 
 # Create training dataset and DataLoader
-train_dataset = UserDataset(train_samples_balanced)
-train_user_data = create_user_datasets(train_samples_balanced)
+train_dataset = UserDataset(train_samples)
+train_user_data = create_user_datasets(train_samples)
 train_sampler = PerUserBatchSampler(train_user_data, batch_size=BATCH_SIZE)
 train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=collate_fn)
 
@@ -409,28 +369,28 @@ class ForecastingModel(nn.Module):
         Forward pass for the forecasting model.
         """
         # Input Dimensions: [B, C, L] where C=INPUT_WINDOWS, L=WINDOW_SIZE
-        bpm_seq = bpm_input  # Shape: [B, 3, 24]
+        bpm_seq = bpm_input  # Shape: [B, INPUT_WINDOWS, WINDOW_SIZE]
         
         # CNN Encoder for BPM
-        bpm_cnn_output = self.bpm_cnn(bpm_seq)  # Shape: [B, 64, 24]
+        bpm_cnn_output = self.bpm_cnn(bpm_seq)  # Shape: [B, 64, WINDOW_SIZE]
         
         # LSTM Encoder for BPM
-        bpm_lstm_output, _ = self.bpm_lstm(bpm_cnn_output.permute(0, 2, 1))  # Shape: [B, 24, 128]
+        bpm_lstm_output, _ = self.bpm_lstm(bpm_cnn_output.permute(0, 2, 1))  # Shape: [B, WINDOW_SIZE, 128]
         
         # Attention for BPM
-        bpm_attn_output, _ = self.bpm_attention(bpm_lstm_output, bpm_lstm_output, bpm_lstm_output)  # Shape: [B, 24, 128]
-        bpm_attn_output = bpm_attn_output.mean(dim=1)  # Aggregate over time steps
+        bpm_attn_output, _ = self.bpm_attention(bpm_lstm_output, bpm_lstm_output, bpm_lstm_output)  # Shape: [B, WINDOW_SIZE, 128]
+        bpm_attn_output = bpm_attn_output.mean(dim=1)  # Aggregate over time steps -> [B, 128]
         
         # CNN Encoder for Steps
-        steps_seq = steps_input  # Shape: [B, 3, 24]
-        steps_cnn_output = self.steps_cnn(steps_seq)  # Shape: [B, 64, 24]
+        steps_seq = steps_input  # Shape: [B, INPUT_WINDOWS, WINDOW_SIZE]
+        steps_cnn_output = self.steps_cnn(steps_seq)  # Shape: [B, 64, WINDOW_SIZE]
         
         # LSTM Encoder for Steps
-        steps_lstm_output, _ = self.steps_lstm(steps_cnn_output.permute(0, 2, 1))  # Shape: [B, 24, 128]
+        steps_lstm_output, _ = self.steps_lstm(steps_cnn_output.permute(0, 2, 1))  # Shape: [B, WINDOW_SIZE, 128]
         
         # Attention for Steps
-        steps_attn_output, _ = self.steps_attention(steps_lstm_output, steps_lstm_output, steps_lstm_output)  # Shape: [B, 24, 128]
-        steps_attn_output = steps_attn_output.mean(dim=1)  # Aggregate over time steps
+        steps_attn_output, _ = self.steps_attention(steps_lstm_output, steps_lstm_output, steps_lstm_output)  # Shape: [B, WINDOW_SIZE, 128]
+        steps_attn_output = steps_attn_output.mean(dim=1)  # Aggregate over time steps -> [B, 128]
         
         # Concatenate the attention outputs from BPM and Steps
         combined_features = torch.cat((bpm_attn_output, steps_attn_output), dim=1)  # Shape: [B, 256]
@@ -455,15 +415,20 @@ print(f'Using device: {DEVICE}')
 # 9. Loss Function Definition
 # ============================
 
+from sklearn.utils.class_weight import compute_class_weight
+
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.99, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         """
         Focal Loss for binary classification.
         """
         super(FocalLoss, self).__init__()
-        self.alpha = alpha  # Weighting factor for positive class (spike)
         self.gamma = gamma
         self.reduction = reduction
+        if alpha is not None:
+            self.alpha = alpha
+        else:
+            self.alpha = torch.tensor([1.0, 1.0]).to(DEVICE)  # Default weights
     
     def forward(self, inputs, targets):
         """
@@ -472,7 +437,7 @@ class FocalLoss(nn.Module):
         BCE_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
         # Correct calculation of alpha_t
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        alpha_t = self.alpha[1] * targets + self.alpha[0] * (1 - targets)
         F_loss = alpha_t * (1 - pt) ** self.gamma * BCE_loss
         
         if self.reduction == 'mean':
@@ -481,7 +446,7 @@ class FocalLoss(nn.Module):
             return F_loss.sum()
 
 class CombinedLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=1.0, gamma=2.0, focal_alpha=0.99):
+    def __init__(self, alpha=1.0, beta=1.0, gamma=2.0, focal_alpha=None):
         """
         Combined Loss for regression and classification tasks.
         """
@@ -507,12 +472,19 @@ class CombinedLoss(nn.Module):
         total_loss = self.alpha * loss_regression + self.beta * loss_classification
         return total_loss
 
-# Instantiate the loss function with adjusted alpha
-criterion = CombinedLoss(alpha=1.0, beta=1.0, gamma=2.0, focal_alpha=0.99)
-
 # ============================
 # 10. Optimizer and Scheduler Setup
 # ============================
+
+# Compute class weights based on the training data
+all_train_spike_labels = np.concatenate([sample['spike_labels'] for sample in train_samples])
+classes = np.unique(all_train_spike_labels)
+class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=all_train_spike_labels)
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+print(f"Class Weights: {class_weights}")
+
+# Instantiate the loss function with class weights
+criterion = CombinedLoss(alpha=1.0, beta=1.0, gamma=2.0, focal_alpha=class_weights)
 
 # Initialize the optimizer
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -735,20 +707,6 @@ for epoch in range(NUM_EPOCHS):
           f'Spike Recall: {spike_recall:.4f}, '
           f'Spike F1: {spike_f1:.4f}, '
           f'Best Threshold: {best_threshold:.2f}') 
-    
-    # ---------------------
-    # Visualize Spike Probability Distribution
-    # ---------------------
-    if (epoch + 1) % 10 == 0 or epoch == NUM_EPOCHS - 1:
-        plt.figure(figsize=(10, 6))
-        sns.histplot(spike_probs[spike_labels == 1], color='red', label='Actual Spikes', bins=50, kde=True)
-        sns.histplot(spike_probs[spike_labels == 0], color='blue', label='Actual No-Spikes', bins=50, kde=True)
-        plt.xlabel('Predicted Spike Probability')
-        plt.ylabel('Frequency')
-        plt.title(f'Spike Probability Distribution at Epoch {epoch+1}')
-        plt.legend()
-        plt.savefig(os.path.join(ANALYSIS_DIR, f'spike_probability_distribution_epoch_{epoch+1}.png'))
-        plt.close()
 
 # ============================
 # 12. Generate Charts
