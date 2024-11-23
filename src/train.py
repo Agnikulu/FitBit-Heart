@@ -26,14 +26,15 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 # Parameters
-WINDOW_SIZE = 6          # Number of time steps in each window
-INPUT_WINDOWS = 4         # Number of input windows to consider for prediction 
-PREDICT_WINDOW = 1        # Number of windows to predict
-BATCH_SIZE = 128          # Batch size for training and validation
-NUM_EPOCHS = 150          # Number of training epochs
-PATIENCE = 25             # Patience for early stopping
-LEARNING_RATE = 0.001     # Learning rate for optimizer
-WEIGHT_DECAY = 1e-5       # Weight decay for optimizer
+WINDOW_SIZE = 12         # Number of time steps in each window
+INPUT_WINDOWS = 6        # Number of input windows to consider for prediction 
+PREDICT_WINDOW = 2       # Number of windows to predict
+BATCH_SIZE = 128         # Batch size for training and validation
+NUM_EPOCHS = 150         # Number of training epochs
+PATIENCE = 25            # Patience for early stopping
+LEARNING_RATE = 0.001    # Learning rate for optimizer
+WEIGHT_DECAY = 1e-5      # Weight decay for optimizer
+SPIKE_STD_THRESHOLD = 2.0  # Number of standard deviations to define a spike
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Device configuration
 
 # Directories
@@ -64,46 +65,174 @@ df = df.sort_values(by=['id', 'datetime']).reset_index(drop=True)
 df = df.dropna().reset_index(drop=True)
 
 # ============================
-# 3. Data Normalization with RobustScaler
+# 3. Spike Label Calculation Before Scaling
+# ============================
+
+def calculate_spike_labels(df, spike_std_threshold):
+    """
+    Calculates spike labels based on original 'steps' before scaling.
+    A spike is defined as any time step in the window where 'steps' are more than
+    'spike_std_threshold' standard deviations away from the user's mean.
+    """
+    data_samples = []
+    user_groups = df.groupby('id')
+    
+    # Precompute mean and std per user for spike detection based on original steps
+    user_stats = df.groupby('id')['steps'].agg(
+        mean='mean',
+        std='std'
+    ).to_dict('index')
+    
+    for user_id, group in user_groups:
+        windows = []
+        # Create non-overlapping windows
+        for i in range(0, len(group), WINDOW_SIZE):
+            window = group.iloc[i:i+WINDOW_SIZE]
+            if len(window) == WINDOW_SIZE:
+                windows.append(window)
+        # Create samples with INPUT_WINDOWS and PREDICT_WINDOW
+        for i in range(len(windows) - INPUT_WINDOWS - PREDICT_WINDOW + 1):
+            input_windows = windows[i:i+INPUT_WINDOWS]
+            target_window = windows[i+INPUT_WINDOWS]
+            steps_target_original = target_window['steps'].values  # Original steps
+            
+            mean = user_stats[user_id]['mean']
+            std = user_stats[user_id]['std']
+            upper_threshold = mean + spike_std_threshold * std
+            lower_threshold = mean - spike_std_threshold * std
+            
+            # Define spike: any time step in the window exceeds thresholds
+            is_spike = ((steps_target_original > upper_threshold) | (steps_target_original < lower_threshold)).any()
+            spike_label = float(is_spike)  # 1.0 if spike exists in window, else 0.0
+            
+            # Extract time-based features from the target window
+            datetime_np = target_window['datetime'].values[0]
+            datetime = pd.to_datetime(datetime_np)
+            hour = datetime.hour
+            day_of_week = datetime.dayofweek
+            
+            data_samples.append({
+                'user_id': user_id,
+                'datetime': datetime,
+                'hour': hour,
+                'day_of_week': day_of_week,
+                'bpm_input': np.array([w['bpm'].values for w in input_windows]),      # Original BPM for scaling
+                'steps_input': np.array([w['steps'].values for w in input_windows]),  # Original Steps for scaling
+                'bpm_target_original': target_window['bpm'].values,                   # Original BPM target
+                'steps_target_original': target_window['steps'].values,               # Original Steps target
+                'spike_label': spike_label
+            })
+    return data_samples
+
+# Generate data samples with spike labels calculated before scaling
+data_samples = calculate_spike_labels(df, SPIKE_STD_THRESHOLD)
+
+# ============================
+# 3a. Analyze Spike Label Distribution
+# ============================
+
+# Calculate number of samples with spikes and without spikes
+num_spikes = sum(1 for sample in data_samples if sample['spike_label'] == 1.0)
+num_no_spikes = len(data_samples) - num_spikes
+
+print(f"Number of samples with spikes: {num_spikes}")
+print(f"Number of samples without spikes: {num_no_spikes}")
+
+# Optionally, visualize the distribution
+plt.figure(figsize=(6,4))
+sns.barplot(x=['No Spike', 'Spike'], y=[num_no_spikes, num_spikes], palette='viridis')
+plt.title('Distribution of Spike Labels')
+plt.ylabel('Number of Samples')
+plt.xlabel('Spike Label')
+plt.savefig(os.path.join(ANALYSIS_DIR, 'spike_label_distribution.png'))
+plt.close()
+print(f"Saved spike label distribution plot at {os.path.join(ANALYSIS_DIR, 'spike_label_distribution.png')}")
+
+# ============================
+# 4. Data Normalization with RobustScaler (Per User)
 # ============================
 
 user_scalers = {}
 
-def scale_per_user(group):
+def fit_scalers_per_user(df, data_samples, spike_std_threshold):
     """
-    Applies RobustScaler to BPM and Steps data for each user.
-    Stores scaler parameters for inverse transformations.
+    Fits RobustScaler for BPM and Steps per user based on all their data.
+    Then transforms each sample using the fitted scalers.
     """
-    user_id = group.name
-    scaler_bpm = RobustScaler()
-    scaler_steps = RobustScaler()
-    group['bpm_scaled'] = scaler_bpm.fit_transform(group['bpm'].values.reshape(-1,1)).flatten()
-    group['steps_scaled'] = scaler_steps.fit_transform(group['steps'].values.reshape(-1,1)).flatten()
-    user_scalers[user_id] = {
-        'bpm_median': scaler_bpm.center_[0],
-        'bpm_scale': scaler_bpm.scale_[0],
-        'steps_median': scaler_steps.center_[0],
-        'steps_scale': scaler_steps.scale_[0]
-    }
-    return group
-
-# Apply scaling per user with RobustScaler
-df = df.groupby('id').apply(scale_per_user).reset_index(drop=True)
+    user_groups = df.groupby('id')
+    
+    for user_id, group in user_groups:
+        # Fit scalers on the entire data for each user
+        scaler_bpm = RobustScaler()
+        scaler_steps = RobustScaler()
+        
+        bpm_data = group['bpm'].values.reshape(-1, 1)    # Shape: [N, 1]
+        steps_data = group['steps'].values.reshape(-1, 1)  # Shape: [N, 1]
+        
+        scaler_bpm.fit(bpm_data)
+        scaler_steps.fit(steps_data)
+        
+        # Store scaler objects
+        user_scalers[user_id] = {
+            'scaler_bpm': scaler_bpm,
+            'scaler_steps': scaler_steps
+        }
+    
+    # Now, transform each sample using the fitted scalers
+    for sample in data_samples:
+        user_id = sample['user_id']
+        scaler_bpm = user_scalers[user_id]['scaler_bpm']
+        scaler_steps = user_scalers[user_id]['scaler_steps']
+        
+        # Scale BPM Input
+        bpm_input = sample['bpm_input']  # Shape: [INPUT_WINDOWS, WINDOW_SIZE] => [5, 6]
+        bpm_input_reshaped = bpm_input.reshape(-1, 1)  # Shape: [30, 1]
+        bpm_scaled = scaler_bpm.transform(bpm_input_reshaped).reshape(INPUT_WINDOWS, WINDOW_SIZE)  # Shape: [5, 6]
+        sample['bpm_input_scaled'] = bpm_scaled
+        
+        # Scale Steps Input
+        steps_input = sample['steps_input']  # Shape: [INPUT_WINDOWS, WINDOW_SIZE] => [5, 6]
+        steps_input_reshaped = steps_input.reshape(-1, 1)  # Shape: [30, 1]
+        steps_scaled = scaler_steps.transform(steps_input_reshaped).reshape(INPUT_WINDOWS, WINDOW_SIZE)  # Shape: [5, 6]
+        sample['steps_input_scaled'] = steps_scaled
+        
+        # **Corrected Reshaping for Targets**
+        # Scale BPM Target
+        bpm_target_original = sample['bpm_target_original']  # Shape: [6]
+        bpm_target_reshaped = bpm_target_original.reshape(-1, 1)  # Shape: [6, 1]
+        bpm_target_scaled = scaler_bpm.transform(bpm_target_reshaped).flatten()  # Shape: [6]
+        sample['bpm_target_scaled'] = bpm_target_scaled
+        
+        # Scale Steps Target
+        steps_target_original = sample['steps_target_original']  # Shape: [6]
+        steps_target_reshaped = steps_target_original.reshape(-1, 1)  # Shape: [6, 1]
+        steps_target_scaled = scaler_steps.transform(steps_target_reshaped).flatten()  # Shape: [6]
+        sample['steps_target_scaled'] = steps_target_scaled
+    
+    return data_samples
 
 def inverse_transform(user_id, bpm_scaled, steps_scaled):
     """
-    Reverts scaled BPM and Steps data back to original scale using stored scaler parameters.
+    Reverts scaled BPM and Steps data back to original scale using stored scaler objects.
     """
-    bpm_median = user_scalers[user_id]['bpm_median']
-    bpm_scale = user_scalers[user_id]['bpm_scale']
-    steps_median = user_scalers[user_id]['steps_median']
-    steps_scale = user_scalers[user_id]['steps_scale']
-    bpm_original = bpm_scaled * bpm_scale + bpm_median
-    steps_original = steps_scaled * steps_scale + steps_median
+    scaler_bpm = user_scalers[user_id]['scaler_bpm']
+    scaler_steps = user_scalers[user_id]['scaler_steps']
+    
+    # Inverse transform BPM
+    bpm_scaled_reshaped = bpm_scaled.reshape(1, -1)  # Shape: [1, 6]
+    bpm_original = scaler_bpm.inverse_transform(bpm_scaled_reshaped).flatten()  # Shape: [6]
+    
+    # Inverse transform Steps
+    steps_scaled_reshaped = steps_scaled.reshape(1, -1)  # Shape: [1, 6]
+    steps_original = scaler_steps.inverse_transform(steps_scaled_reshaped).flatten()  # Shape: [6]
+    
     return bpm_original, steps_original
 
+# Fit and transform scalers per user
+data_samples = fit_scalers_per_user(df, data_samples, SPIKE_STD_THRESHOLD)
+
 # ============================
-# 4. Dataset Preparation
+# 5. Dataset Preparation
 # ============================
 
 class UserDataset(Dataset):
@@ -118,107 +247,18 @@ class UserDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.data[idx]
-        bpm_input = torch.tensor(sample['bpm_input'], dtype=torch.float32)
-        steps_input = torch.tensor(sample['steps_input'], dtype=torch.float32)
-        bpm_target = torch.tensor(sample['bpm_target'], dtype=torch.float32)
-        steps_target = torch.tensor(sample['steps_target'], dtype=torch.float32)
-        spike_labels = torch.tensor(sample['spike_labels'], dtype=torch.float32)
+        bpm_input = torch.tensor(sample['bpm_input_scaled'], dtype=torch.float32)    # [INPUT_WINDOWS, WINDOW_SIZE]
+        steps_input = torch.tensor(sample['steps_input_scaled'], dtype=torch.float32)  # [INPUT_WINDOWS, WINDOW_SIZE]
+        bpm_target = torch.tensor(sample['bpm_target_scaled'], dtype=torch.float32)  # [WINDOW_SIZE]
+        steps_target = torch.tensor(sample['steps_target_scaled'], dtype=torch.float32)  # [WINDOW_SIZE]
+        spike_label = torch.tensor(sample['spike_label'], dtype=torch.float32)        # Single label per window
         user_id = sample['user_id']
-        bpm_target_original = torch.tensor(sample['bpm_target_original'], dtype=torch.float32)
-        steps_target_original = torch.tensor(sample['steps_target_original'], dtype=torch.float32)
+        bpm_target_original = torch.tensor(sample['bpm_target_original'], dtype=torch.float32)  # [WINDOW_SIZE]
+        steps_target_original = torch.tensor(sample['steps_target_original'], dtype=torch.float32)  # [WINDOW_SIZE]
         datetime = sample.get('datetime', None)
         hour = sample.get('hour', 0)
         day_of_week = sample.get('day_of_week', 0)
-        weight = sample.get('weight', 1.0)
-        return bpm_input, steps_input, bpm_target, steps_target, spike_labels, user_id, bpm_target_original, steps_target_original, datetime, weight, hour, day_of_week
-
-def create_data_samples(df):
-    """
-    Creates data samples by sliding a window of INPUT_WINDOWS to predict the PREDICT_WINDOW.
-    Labels each time step in the target window with spike labels and includes time-based features.
-    """
-    data_samples = []
-    user_groups = df.groupby('id')
-    
-    # Precompute percentiles per user for spike detection
-    user_stats = df.groupby('id')['steps'].agg(
-        mean='mean',
-        std='std',
-        lower_percentile=lambda x: np.percentile(x, 10),
-        upper_percentile=lambda x: np.percentile(x, 90)
-    ).to_dict('index')
-    
-    for user_id, group in user_groups:
-        windows = []
-        # Create non-overlapping windows
-        for i in range(0, len(group), WINDOW_SIZE):
-            window = group.iloc[i:i+WINDOW_SIZE]
-            if len(window) == WINDOW_SIZE:
-                windows.append(window)
-        # Create samples with INPUT_WINDOWS and PREDICT_WINDOW
-        for i in range(len(windows) - INPUT_WINDOWS - PREDICT_WINDOW + 1):
-            input_windows = windows[i:i+INPUT_WINDOWS]
-            target_window = windows[i+INPUT_WINDOWS]
-            steps_target = target_window['steps'].values
-            # Define spike thresholds using percentiles
-            lower_threshold = user_stats[user_id]['lower_percentile']  # 10th percentile
-            upper_threshold = user_stats[user_id]['upper_percentile']  # 90th percentile
-            # Label spikes
-            spike_labels = ((steps_target > upper_threshold) | (steps_target < lower_threshold)).astype(float)
-            # Extract time-based features from the target window
-            datetime_np = target_window['datetime'].values[0]
-            # Convert numpy.datetime64 to pandas.Timestamp
-            datetime = pd.to_datetime(datetime_np)
-            hour = datetime.hour
-            day_of_week = datetime.dayofweek
-            data_samples.append({
-                'bpm_input': np.array([w['bpm_scaled'].values for w in input_windows]),
-                'steps_input': np.array([w['steps_scaled'].values for w in input_windows]),
-                'bpm_target': target_window['bpm_scaled'].values,
-                'steps_target': target_window['steps_scaled'].values,
-                'spike_labels': spike_labels,
-                'bpm_target_original': target_window['bpm'].values,
-                'steps_target_original': target_window['steps'].values,
-                'user_id': user_id,
-                'datetime': datetime,  # Now a pandas.Timestamp
-                'hour': hour,
-                'day_of_week': day_of_week
-            })
-    return data_samples
-
-# Generate data samples
-data_samples = create_data_samples(df)
-
-# ============================
-# 5. Analyze Class Imbalance
-# ============================
-
-# Calculate total number of spike and no-spike samples
-total_spike_labels = np.concatenate([sample['spike_labels'] for sample in data_samples])
-num_spikes = np.sum(total_spike_labels)
-num_no_spikes = len(total_spike_labels) - num_spikes
-
-print(f"Total samples: {len(data_samples)}")
-print(f"Total time steps (spike labels): {len(total_spike_labels)}")
-print(f"Number of spike samples: {int(num_spikes)}")
-print(f"Number of no-spike samples: {int(num_no_spikes)}")
-print(f"Spike sample ratio: {num_spikes / len(total_spike_labels):.4f}")
-
-# ============================
-# 6. Train-Validation Split
-# ============================
-
-# Implement user-level train-validation split to prevent data leakage
-unique_user_ids = df['id'].unique()
-train_user_ids, val_user_ids = train_test_split(unique_user_ids, test_size=0.2, random_state=SEED)
-
-# Filter data_samples based on user IDs
-train_samples = [sample for sample in data_samples if sample['user_id'] in train_user_ids]
-val_samples = [sample for sample in data_samples if sample['user_id'] in val_user_ids]
-
-# ============================
-# 7A. DataLoader Setup
-# ============================
+        return bpm_input, steps_input, bpm_target, steps_target, spike_label, user_id, bpm_target_original, steps_target_original, datetime, hour, day_of_week
 
 def create_user_datasets(data_samples):
     """
@@ -234,20 +274,19 @@ def collate_fn(batch):
     """
     Custom collate function to handle batching of samples.
     """
-    bpm_inputs = torch.stack([s[0] for s in batch])
-    steps_inputs = torch.stack([s[1] for s in batch])
-    bpm_targets = torch.stack([s[2] for s in batch])
-    steps_targets = torch.stack([s[3] for s in batch])
-    spike_labels = torch.stack([s[4] for s in batch])
-    user_ids = [s[5] for s in batch]
-    bpm_targets_original = [s[6] for s in batch]
-    steps_targets_original = [s[7] for s in batch]
-    datetimes = [s[8] for s in batch]
-    weights = [s[9] for s in batch]
-    hours = torch.tensor([s[10] for s in batch], dtype=torch.long)
-    days_of_week = torch.tensor([s[11] for s in batch], dtype=torch.long)
+    bpm_inputs = torch.stack([s[0] for s in batch])             # [B, INPUT_WINDOWS, WINDOW_SIZE]
+    steps_inputs = torch.stack([s[1] for s in batch])           # [B, INPUT_WINDOWS, WINDOW_SIZE]
+    bpm_targets = torch.stack([s[2] for s in batch])            # [B, WINDOW_SIZE]
+    steps_targets = torch.stack([s[3] for s in batch])          # [B, WINDOW_SIZE]
+    spike_labels = torch.tensor([s[4] for s in batch], dtype=torch.float32)  # [B]
+    user_ids = [s[5] for s in batch]                           # List of user_ids
+    bpm_targets_original = [s[6] for s in batch]               # List of [WINDOW_SIZE]
+    steps_targets_original = [s[7] for s in batch]             # List of [WINDOW_SIZE]
+    datetimes = [s[8] for s in batch]                         # List of datetime
+    hours = torch.tensor([s[9] for s in batch], dtype=torch.long)         # [B]
+    days_of_week = torch.tensor([s[10] for s in batch], dtype=torch.long)  # [B]
     return (bpm_inputs, steps_inputs, bpm_targets, steps_targets, spike_labels, user_ids,
-            bpm_targets_original, steps_targets_original, datetimes, weights, hours, days_of_week)
+            bpm_targets_original, steps_targets_original, datetimes, hours, days_of_week)
 
 # Define PerUserBatchSampler
 class PerUserBatchSampler(Sampler):
@@ -273,6 +312,25 @@ class PerUserBatchSampler(Sampler):
     
     def __len__(self):
         return len(self.batches)
+
+# ============================
+# 6. Train-Validation Split
+# ============================
+
+# Implement user-level train-validation split to prevent data leakage
+unique_user_ids = df['id'].unique()
+train_user_ids, val_user_ids = train_test_split(unique_user_ids, test_size=0.2, random_state=SEED)
+
+# Filter data_samples based on user IDs
+train_samples = [sample for sample in data_samples if sample['user_id'] in train_user_ids]
+val_samples = [sample for sample in data_samples if sample['user_id'] in val_user_ids]
+
+print(f"Training samples: {len(train_samples)}")
+print(f"Validation samples: {len(val_samples)}")
+
+# ============================
+# 7A. DataLoader Setup
+# ============================
 
 # Create training dataset and DataLoader
 train_dataset = UserDataset(train_samples)
@@ -319,8 +377,8 @@ class ResidualBlock(nn.Module):
 class ForecastingModel(nn.Module):
     """
     Forecasting model with separate CNN and LSTM encoders for BPM and Steps,
-    Attention mechanisms, Residual Connections, Fusion layers, Decoders,
-    and a Classification head for per-time-step spike detection.
+    Attention mechanisms, Residual Connections, Fusion layers,
+    Decoders, and a Classification head for per-window spike detection.
     """
     def __init__(self):
         super(ForecastingModel, self).__init__()
@@ -355,12 +413,12 @@ class ForecastingModel(nn.Module):
         self.bpm_decoder = nn.Linear(128, WINDOW_SIZE)    # Predict BPM
         self.steps_decoder = nn.Linear(128, WINDOW_SIZE)  # Predict Steps
         
-        # Classification Head for per-time-step Spike Detection
+        # Classification Head for per-window Spike Detection
         self.classifier = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, WINDOW_SIZE),  # Output per time step
+            nn.Linear(64, 1),  # Single output for window-level prediction
             # Note: We'll use BCEWithLogitsLoss or FocalLoss, so no Sigmoid here
         )
     
@@ -403,7 +461,7 @@ class ForecastingModel(nn.Module):
         steps_pred = self.steps_decoder(fused_features)  # Shape: [B, WINDOW_SIZE]
         
         # Classification Head
-        spike_logits = self.classifier(fused_features)   # Shape: [B, WINDOW_SIZE]
+        spike_logits = self.classifier(fused_features)   # Shape: [B, 1]
         
         return bpm_pred, steps_pred, spike_logits
 
@@ -414,8 +472,6 @@ print(f'Using device: {DEVICE}')
 # ============================
 # 9. Loss Function Definition
 # ============================
-
-from sklearn.utils.class_weight import compute_class_weight
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
@@ -439,7 +495,7 @@ class FocalLoss(nn.Module):
         # Correct calculation of alpha_t
         alpha_t = self.alpha[1] * targets + self.alpha[0] * (1 - targets)
         F_loss = alpha_t * (1 - pt) ** self.gamma * BCE_loss
-        
+    
         if self.reduction == 'mean':
             return F_loss.mean()
         else:
@@ -465,7 +521,10 @@ class CombinedLoss(nn.Module):
         loss_steps = self.regression_loss(steps_pred, steps_target)
         loss_regression = (loss_bpm + loss_steps) / 2  # Average to balance
         
-        # Classification Loss (per time step)
+        # Classification Loss (per window)
+        # Ensure spike_logits and spike_label are [B]
+        spike_logits = spike_logits.squeeze()  # [B]
+        spike_label = spike_label.squeeze()    # [B]
         loss_classification = self.classification_loss(spike_logits, spike_label)
         
         # Total Loss
@@ -477,13 +536,19 @@ class CombinedLoss(nn.Module):
 # ============================
 
 # Compute class weights based on the training data
-all_train_spike_labels = np.concatenate([sample['spike_labels'] for sample in train_samples])
+all_train_spike_labels = np.array([sample['spike_label'] for sample in train_samples])
 classes = np.unique(all_train_spike_labels)
-class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=all_train_spike_labels)
-class_weights = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
-print(f"Class Weights: {class_weights}")
 
-# Instantiate the loss function with class weights
+# Extract spike labels from training samples
+train_spike_labels = np.array([sample['spike_label'] for sample in train_samples])
+
+# Compute class weights
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(train_spike_labels), y=train_spike_labels)
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+
+print(f"Computed Class Weights: {class_weights}")
+
+# Instantiate the loss function with class weights and adjusted gamma
 criterion = CombinedLoss(alpha=1.0, beta=1.0, gamma=2.0, focal_alpha=class_weights)
 
 # Initialize the optimizer
@@ -531,24 +596,20 @@ for epoch in range(NUM_EPOCHS):
     model.train()
     epoch_loss = 0.0
     for batch in train_loader:
-        (bpm_input, steps_input, bpm_target, steps_target, spike_labels, _, _, _, _, _, hours, days_of_week) = batch
+        (bpm_input, steps_input, bpm_target, steps_target, spike_labels, _, _, _, _, hours, days_of_week) = batch
         optimizer.zero_grad()
         
         # Move tensors to the device
-        bpm_input = bpm_input.to(DEVICE)
-        steps_input = steps_input.to(DEVICE)
-        bpm_target = bpm_target.to(DEVICE)
-        steps_target = steps_target.to(DEVICE)
-        spike_labels = spike_labels.to(DEVICE)
+        bpm_input = bpm_input.to(DEVICE)            # [B, INPUT_WINDOWS, WINDOW_SIZE]
+        steps_input = steps_input.to(DEVICE)        # [B, INPUT_WINDOWS, WINDOW_SIZE]
+        bpm_target = bpm_target.to(DEVICE)          # [B, WINDOW_SIZE]
+        steps_target = steps_target.to(DEVICE)      # [B, WINDOW_SIZE]
+        spike_labels = spike_labels.to(DEVICE)      # [B]
         hours = hours.to(DEVICE)
         days_of_week = days_of_week.to(DEVICE)
         
         # Forward pass
         bpm_pred, steps_pred, spike_logits = model(bpm_input, steps_input, hours, days_of_week)
-        
-        # Ensure tensor shapes match
-        if spike_logits.shape != spike_labels.shape:
-            spike_labels = spike_labels.view_as(spike_logits)
         
         # Compute combined loss
         loss = criterion(bpm_pred, bpm_target, steps_pred, steps_target, spike_logits, spike_labels)
@@ -580,7 +641,7 @@ for epoch in range(NUM_EPOCHS):
         for batch in val_loader:
             (bpm_input, steps_input, bpm_target, steps_target, spike_labels,
              user_id, bpm_target_original, steps_target_original, datetimes,
-             _, hours, days_of_week) = batch
+             hours, days_of_week) = batch
             # Move tensors to the device
             bpm_input = bpm_input.to(DEVICE)
             steps_input = steps_input.to(DEVICE)
@@ -592,11 +653,7 @@ for epoch in range(NUM_EPOCHS):
             
             # Forward pass
             bpm_pred_scaled, steps_pred_scaled, spike_logits = model(bpm_input, steps_input, hours, days_of_week)
-            spike_prob = torch.sigmoid(spike_logits)
-            
-            # Ensure tensor shapes match
-            if spike_logits.shape != spike_labels.shape:
-                spike_labels = spike_labels.view_as(spike_logits)
+            spike_prob = torch.sigmoid(spike_logits).squeeze()  # [B]
             
             # Compute combined loss
             loss = criterion(bpm_pred_scaled, bpm_target, steps_pred_scaled, steps_target, spike_logits, spike_labels)
@@ -622,8 +679,8 @@ for epoch in range(NUM_EPOCHS):
                 total_steps_error += steps_error
                 
                 # Collect spike probabilities and labels for metrics
-                all_spike_probs.extend(spike_prob[i].cpu().numpy())
-                all_spike_labels.extend(spike_labels[i].cpu().numpy())
+                all_spike_probs.append(spike_prob[i].cpu().numpy())
+                all_spike_labels.append(spike_labels[i].cpu().numpy())
                 
                 # Store detailed error information
                 validation_errors_epoch.append({
@@ -645,25 +702,25 @@ for epoch in range(NUM_EPOCHS):
     
     # Compute spike metrics
     spike_probs = np.array(all_spike_probs)
-    spike_labels = np.array(all_spike_labels)
+    spike_labels_np = np.array(all_spike_labels)
     
-    # Adjust the threshold for spike prediction
+    # Adjust the threshold for spike prediction to maximize F1 score
     thresholds = np.linspace(0.1, 0.9, 9)
     best_f1 = 0
     best_threshold = 0.5
     for thresh in thresholds:
         spike_preds = (spike_probs >= thresh).astype(int)
-        f1 = f1_score(spike_labels, spike_preds, zero_division=0)
+        f1 = f1_score(spike_labels_np, spike_preds, zero_division=0)
         if f1 > best_f1:
             best_f1 = f1
             best_threshold = thresh
     
     # Use the best threshold
     spike_preds = (spike_probs >= best_threshold).astype(int)
-    spike_accuracy = accuracy_score(spike_labels, spike_preds)
-    spike_precision = precision_score(spike_labels, spike_preds, zero_division=0)
-    spike_recall = recall_score(spike_labels, spike_preds, zero_division=0)
-    spike_f1 = f1_score(spike_labels, spike_preds, zero_division=0)
+    spike_accuracy = accuracy_score(spike_labels_np, spike_preds)
+    spike_precision = precision_score(spike_labels_np, spike_preds, zero_division=0)
+    spike_recall = recall_score(spike_labels_np, spike_preds, zero_division=0)
+    spike_f1 = f1_score(spike_labels_np, spike_preds, zero_division=0)
     
     # Log statistics
     stats['epoch'].append(epoch + 1)
