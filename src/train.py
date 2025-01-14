@@ -26,9 +26,9 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 # Parameters
-WINDOW_SIZE = 12         # Number of time steps in each window
-INPUT_WINDOWS = 6        # Number of input windows to consider for prediction 
-PREDICT_WINDOW = 2       # Number of windows to predict
+WINDOW_SIZE = 6          # Number of time steps in each window
+INPUT_WINDOWS = 16       # Number of input windows to consider for prediction 
+PREDICT_WINDOW = 4       # Number of windows to predict
 BATCH_SIZE = 128         # Batch size for training and validation
 NUM_EPOCHS = 150         # Number of training epochs
 PATIENCE = 25            # Patience for early stopping
