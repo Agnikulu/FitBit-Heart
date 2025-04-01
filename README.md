@@ -32,64 +32,70 @@
 ---
 
 ## **2. Model Architectures**  
-
-### **2.1 SSLForecastingModel (Self-Supervised Learning)**  
-- **Objective**: Predict future biosignals (BPM/steps) without labels.  
-- **Structure**:  
-  ```python
-  nn.Sequential(
-    nn.Conv1d(1, 32, kernel_size=3, padding=1),  # Input: [B, 1, 12]
-    nn.ReLU(),
-    nn.Dropout(0.3),
-    nn.Conv1d(32, 64, kernel_size=3, padding=1),
-    nn.ReLU(),
-    nn.Dropout(0.3)
-  )
-  ```
-  - **Fusion**: Concatenated LSTM outputs (`[B, 256]`) → linear heads for BPM/steps prediction.  
-
-### **2.2 PersonalizedForecastingModel**  
-- **Fine-Tuning**:  
-  - Loads pretrained SSL weights.  
-  - Unfreezes 50% of layers (e.g., last CNN/LSTM layers).  
-  - Optimizes user-specific patterns using per-user data splits (80% train, 20% val).  
-
-### **2.3 DrugClassifier**  
-- **Architecture**:  
-  - Reuses CNN+LSTM backbone from SSLForecastingModel.  
-  - Classification head:  
-    ```python
-    nn.Sequential(
-      nn.Linear(256, 128),  
-      nn.ReLU(),
-      nn.Dropout(0.3),
-      nn.Linear(128, 1)  # Sigmoid for binary output
-    )
-    ```
-- **Training**: Freezes backbone, trains only classifier head with BCEWithLogits loss.  
-
----
-
-## **3. Training Procedures**  
-
-### **3.1 SSL Pretraining**  
-- **Dataset**: `lifesnaps.csv` (external dataset).  
-- **Hyperparameters**:  
-  - Optimizer: Adam (`lr=0.001`, `weight_decay=1e-5`).  
-  - Loss: Weighted SmoothL1 (`alpha=0.85` for BPM, `beta=0.15` for steps).  
-- **Results**:  
-  | Epoch | Train Loss | Val Loss | BPM MAE | Steps MAE |  
-  |-------|------------|----------|---------|-----------|  
-  | 1     | 0.307      | 0.220    | 6.75    | 357.1     |  
-  | 50    | 0.203      | 0.164    | 5.54    | 301.4     |  
-
-### **3.2 Personalized Fine-Tuning**  
-- **Key Metrics**:  
-  | User ID | Best Val Loss | BPM MAE | Steps MAE |  
-  |---------|---------------|---------|-----------|  
-  | 20      | 0.162         | 3.27    | 406.9     |  
-  | 35      | 0.118         | 5.96    | 317.6     |  
-  | 31      | 0.487         | 11.65   | 307.9     |  
+ 
+ ### **2.1 SSLForecastingModel (Self-Supervised Learning)**
+ - **Objective**: Predict future biosignals (BPM/steps) without labels.  
+ - **Structure**:  
+   - **BPM Encoder**:  
+     ```python
+     nn.Sequential(
+       nn.Conv1d(1, 32, kernel_size=3, padding=1),  # Input: [B, 1, 12]
+       nn.ReLU(),
+       nn.Dropout(0.3),
+       nn.Conv1d(32, 64, kernel_size=3, padding=1),
+       nn.ReLU(),
+       nn.Dropout(0.3)
+     )
+     ```
+     → LSTM(64 → 128, 2 layers).  
+   - **Steps Encoder**: Identical structure to BPM encoder.  
+   - **Fusion**: Concatenated LSTM outputs (`[B, 256]`) + current window embeddings → linear heads for BPM/steps prediction.  
+ 
+ ### **2.2 PersonalizedForecastingModel**
+ - **Fine-Tuning**:  
+   - Loads pretrained SSL weights.  
+   - Unfreezes 50% of layers (e.g., last CNN/LSTM layers) via `partially_unfreeze_backbone()`.  
+   - Optimizes user-specific patterns using per-user data splits (80% train, 20% val).  
+ 
+ ### **2.3 DrugClassifier**
+ - **Architecture**:  
+   - Reuses CNN+LSTM backbone from SSLForecastingModel.  
+   - Classification head:  
+     ```python
+     nn.Sequential(
+       nn.Linear(256, 128),  # Fused features
+       nn.ReLU(),
+       nn.Dropout(0.3),
+       nn.Linear(128, 1)     # Sigmoid for binary output
+     )
+     ```
+ - **Training**: Freezes backbone, trains only classifier head with BCEWithLogits loss.  
+ 
+ ---
+ 
+ ## **3. Training Procedures**
+ 
+ ### **3.1 SSL Pretraining**
+ - **Dataset**: `lifesnaps.csv` (external dataset for general biosignal patterns).  
+ - **Hyperparameters**:  
+   - Optimizer: Adam (`lr=0.001`, `weight_decay=1e-5`).  
+   - Loss: Weighted SmoothL1 (`alpha=0.85` for BPM, `beta=0.15` for steps).  
+   - Scheduler: StepLR (γ=0.1 every 20 epochs).  
+ - **Results (from `stats_pretrain.csv`)**:
+   | Epoch | Train Loss | Val Loss | BPM MAE | Steps MAE |
+   |-------|------------|----------|---------|-----------|
+   | 1     | 0.307      | 0.220    | 6.75    | 357.1     |
+   | 50    | 0.203      | 0.164    | 5.54    | 301.4     |
+   - **Trend**: Steady decline in MAE, indicating effective pretraining.  
+ 
+ ### **3.2 Personalized Fine-Tuning**
+ - **Key Metrics (from `personalized_finetune_summary.csv`)**:
+   | User ID | Best Val Loss | BPM MAE | Steps MAE |
+   |---------|---------------|---------|-----------|
+   | 20      | 0.162         | 3.27    | 406.9     |
+   | 35      | 0.118         | 5.96    | 317.6     |
+   | 31      | 0.487         | 11.65   | 307.9     |
+   - **Insight**: High variability in performance (e.g., User 31’s BPM MAE=11.65 vs. User 20’s 3.27). Likely due to data quality (e.g., missing sensor readings).  
 
 ### **3.3 Classification**  
 - **Results (AUC & Accuracy)**:  
