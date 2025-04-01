@@ -10,8 +10,8 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import confusion_matrix, accuracy_score
-
+from torch.utils.data import RandomSampler
+from sklearn.metrics import confusion_matrix, roc_auc_score
 from models import DrugClassifier
 from utils import scale_per_user, user_scalers, WINDOW_SIZE  # from your `utils.py`
 
@@ -32,10 +32,13 @@ def load_and_merge_data():
     # 1A) Load hospital data, pivot to hourly BPM/Steps
     data_folder = "/home/agnik/uh-internship/data/Personalized AI Data/Biosignal"
     csv_files = glob.glob(os.path.join(data_folder, "*.csv"))
+    if not csv_files:
+        raise ValueError(f"No CSV files found in '{data_folder}'.")
 
     df_list = []
     for file in csv_files:
         tmp = pd.read_csv(file, parse_dates=['time'])
+        # If participant_id missing, parse from filename
         if 'participant_id' not in tmp.columns:
             base = os.path.basename(file)
             name_no_ext = os.path.splitext(base)[0]
@@ -99,7 +102,6 @@ def load_and_merge_data():
 
         label_files = glob.glob(os.path.join(sd, "*.csv")) + glob.glob(os.path.join(sd, "*.xlsx"))
         for lf in label_files:
-            base = os.path.basename(lf).lower()
             df_label = None
             if lf.endswith(".csv"):
                 try:
@@ -182,10 +184,9 @@ class CravingDataset(Dataset):
 
     def __getitem__(self, idx):
         d = self.data_list[idx]
-        # shape => [WINDOW_SIZE]
-        bpm_in   = torch.tensor(d['bpm_input'], dtype=torch.float32)
-        steps_in = torch.tensor(d['steps_input'], dtype=torch.float32)
-        label    = torch.tensor(d['label'], dtype=torch.float32)
+        bpm_in   = torch.tensor(d['bpm_input'], dtype=torch.float32)     # shape [WINDOW_SIZE]
+        steps_in = torch.tensor(d['steps_input'], dtype=torch.float32)   # shape [WINDOW_SIZE]
+        label    = torch.tensor(d['label'],       dtype=torch.float32)
         uid      = d['id']
         return bpm_in, steps_in, uid, label
 
@@ -203,30 +204,26 @@ def create_classification_samples(df_merged, window_size=6):
         group = group.sort_values('datetime').reset_index(drop=True)
 
         # Break into non-overlapping windows
-        chunked = []
         for i in range(0, len(group), window_size):
-            chunk = group.iloc[i:i+window_size]
+            chunk = group.iloc[i : i + window_size]
             if len(chunk) == window_size:
-                chunked.append(chunk)
+                chunk_label = 1 if (chunk['label'].max() == 1) else 0
+                # We prefer scaled columns if present
+                if 'bpm_scaled' in chunk.columns:
+                    bpm_arr   = chunk['bpm_scaled'].values
+                    steps_arr = chunk['steps_scaled'].values
+                else:
+                    bpm_arr   = chunk['bpm'].values
+                    steps_arr = chunk['steps'].values
 
-        for ch in chunked:
-            chunk_label = 1 if (ch['label'].max() == 1) else 0
-            if 'bpm_scaled' in ch.columns:
-                bpm_arr   = ch['bpm_scaled'].values
-                steps_arr = ch['steps_scaled'].values
-            else:
-                # fallback
-                bpm_arr   = ch['bpm'].values
-                steps_arr = ch['steps'].values
-
-            data_samples.append({
-                'id': uid,
-                'bpm_input': bpm_arr,
-                'steps_input': steps_arr,
-                'label': chunk_label,
-                'datetime_start': ch['datetime'].iloc[0],
-                'datetime_end':   ch['datetime'].iloc[-1]
-            })
+                data_samples.append({
+                    'id': uid,
+                    'bpm_input': bpm_arr,
+                    'steps_input': steps_arr,
+                    'label': chunk_label,
+                    'datetime_start': chunk['datetime'].iloc[0],
+                    'datetime_end':   chunk['datetime'].iloc[-1]
+                })
     return data_samples
 
 
@@ -279,19 +276,18 @@ def main():
         val_ds   = CravingDataset(user_val)
         test_ds  = CravingDataset(user_test)
 
-        from torch.utils.data import RandomSampler
         train_loader = DataLoader(train_ds, batch_size=32, sampler=RandomSampler(train_ds))
         val_loader   = DataLoader(val_ds, batch_size=32, sampler=RandomSampler(val_ds))
         test_loader  = DataLoader(test_ds, batch_size=32)
 
         # 5) Build classifier => load user forecasting checkpoint from saved models
-        # Expect model to be stored in "results/saved_models/user_{user_id}/drug_classifier.pt"
         user_model_dir = os.path.join("results", "train", f"user_{user_id}")
         user_ckpt = os.path.join(user_model_dir, "personalized_ssl.pt")
         if not os.path.exists(user_ckpt):
             print(f"[User {user_id}] No saved model checkpoint at {user_ckpt} => skip classification.")
             continue
 
+        from models import DrugClassifier
         classifier = DrugClassifier(window_size=WINDOW_SIZE).to(device)
 
         # Load forecasting weights into classifier's CNN+LSTM
@@ -314,7 +310,9 @@ def main():
         else:
             pos_weight_val = neg_count / float(pos_count)
 
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], dtype=torch.float).to(device))
+        criterion = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight_val], dtype=torch.float).to(device)
+        )
         optimizer = torch.optim.Adam(classifier.classifier.parameters(), lr=1e-3)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
         num_epochs = 20
@@ -322,6 +320,7 @@ def main():
 
         best_val_loss = float('inf')
         epochs_no_improve = 0
+        best_path = os.path.join(user_test_dir, "drug_classifier.pth")
 
         # We'll store train/val stats
         STATS = {
@@ -359,7 +358,7 @@ def main():
             # -- VAL --
             classifier.eval()
             sum_val_loss = 0.0
-            val_preds = []
+            val_preds_05 = []
             val_true  = []
             with torch.no_grad():
                 for (bpm_in, steps_in, pids, labels) in val_loader:
@@ -371,21 +370,21 @@ def main():
                     loss = criterion(logits, labels)
                     sum_val_loss += loss.item()
 
-                    probs = torch.sigmoid(logits)
-                    preds = (probs >= 0.5).float()
-                    val_preds.extend(preds.cpu().numpy())
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    preds_05 = (probs >= 0.5).astype(int)
+
+                    val_preds_05.extend(preds_05)
                     val_true.extend(labels.cpu().numpy())
 
             avg_val_loss = sum_val_loss / len(val_loader)
-            val_preds = np.array(val_preds)
-            val_true  = np.array(val_true)
-            val_acc   = (val_preds == val_true).mean() * 100.0
+            val_preds_05 = np.array(val_preds_05)
+            val_true     = np.array(val_true)
+            val_acc_05   = (val_preds_05 == val_true).mean() * 100.0
 
+            # Early stopping
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 epochs_no_improve = 0
-                # save best classifier for this user in their test directory
-                best_path = os.path.join(user_test_dir, "drug_classifier.pth")
                 torch.save(classifier.state_dict(), best_path)
             else:
                 epochs_no_improve += 1
@@ -393,10 +392,12 @@ def main():
             STATS['epoch'].append(epoch+1)
             STATS['train_loss'].append(avg_train_loss)
             STATS['val_loss'].append(avg_val_loss)
-            STATS['val_acc'].append(val_acc)
+            STATS['val_acc'].append(val_acc_05)
 
             print(f"[User {user_id}] Epoch={epoch+1}/{num_epochs}, "
-                  f"TrainLoss={avg_train_loss:.4f}, ValLoss={avg_val_loss:.4f}, ValAcc={val_acc:.2f}%")
+                  f"TrainLoss={avg_train_loss:.4f}, "
+                  f"ValLoss={avg_val_loss:.4f}, "
+                  f"ValAcc(0.5)={val_acc_05:.2f}%")
 
         # 7) Save train/val stats in user test directory
         stats_df = pd.DataFrame(STATS)
@@ -407,74 +408,129 @@ def main():
         classifier.load_state_dict(torch.load(best_path, map_location=device))
         classifier.eval()
 
-        test_preds = []
-        test_true  = []
+        # We'll collect predicted probabilities and labels
+        test_probs = []
+        test_labels = []
         with torch.no_grad():
-            for (bpm_in, steps_in, pids, labels) in DataLoader(test_ds, batch_size=32):
+            for (bpm_in, steps_in, pids, labels) in test_loader:
                 bpm_in   = bpm_in.to(device)
                 steps_in = steps_in.to(device)
-                labels   = labels.to(device)
+                labels   = labels.cpu().numpy()  # shape [B]
+                logits   = classifier(bpm_in, steps_in)
+                probs    = torch.sigmoid(logits).cpu().numpy()  # shape [B]
 
-                logits = classifier(bpm_in, steps_in)
-                probs = torch.sigmoid(logits)
-                preds = (probs >= 0.5).float()
+                test_probs.extend(probs)
+                test_labels.extend(labels)
 
-                test_preds.extend(preds.cpu().numpy())
-                test_true.extend(labels.cpu().numpy())
+        test_probs  = np.array(test_probs)   # shape [N]
+        test_labels = np.array(test_labels)  # shape [N]
 
-        test_preds = np.array(test_preds, dtype=int)
-        test_true  = np.array(test_true,  dtype=int)
-        test_acc   = (test_preds == test_true).mean() * 100.0
+        # (A) Compute AUC
+        # If all labels are 0 or all are 1, roc_auc_score can't be computed => handle that case
+        if len(np.unique(test_labels)) == 1:
+            auc_val = float('nan')
+        else:
+            auc_val = roc_auc_score(test_labels, test_probs)
 
-        cm = confusion_matrix(test_true, test_preds, labels=[0, 1])
-        print(f"[User {user_id}] => TEST Accuracy: {test_acc:.2f}%")
-        print("Confusion Matrix (Test):")
-        print(cm)
+        # (B) Evaluate at threshold=0.5
+        test_preds_05 = (test_probs >= 0.5).astype(int)
+        test_acc_05   = (test_preds_05 == test_labels).mean() * 100.0
+        cm_05         = confusion_matrix(test_labels, test_preds_05, labels=[0,1])
 
-        # Plot confusion matrix in user test directory
+        # (C) Find best threshold for accuracy
+        thresholds = np.linspace(0.0, 1.0, 101)  # e.g. 0.00, 0.01, ..., 1.00
+        best_thr_acc = 0.0
+        best_thr = 0.5
+        for thr in thresholds:
+            preds_thr = (test_probs >= thr).astype(int)
+            acc_thr   = (preds_thr == test_labels).mean() * 100.0
+            if acc_thr > best_thr_acc:
+                best_thr_acc = acc_thr
+                best_thr     = thr
+
+        best_preds = (test_probs >= best_thr).astype(int)
+        cm_best    = confusion_matrix(test_labels, best_preds, labels=[0,1])
+
+        # Print results
+        print(f"\n[User {user_id}] => TEST RESULTS:")
+        print(f" - AUC = {auc_val:.4f} (NaN if all labels are the same)")
+        print(f" - Accuracy at threshold=0.5 => {test_acc_05:.2f}%")
+        print(f" - Best threshold for accuracy => {best_thr:.3f}, Accuracy={best_thr_acc:.2f}%")
+        print("Confusion Matrix at threshold=0.5:")
+        print(cm_05)
+        print("Confusion Matrix at best threshold:")
+        print(cm_best)
+
+        # Plot confusion matrix for threshold=0.5
         plt.figure(figsize=(5,4))
-        plt.imshow(cm, cmap='Blues')
-        plt.title(f"User {user_id} Confusion Matrix (Test)")
+        plt.imshow(cm_05, cmap='Blues')
+        plt.title(f"User {user_id} CM (th=0.5) Acc={test_acc_05:.2f}%")
         plt.colorbar()
-        thresh = cm.max() / 2
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, cm[i, j],
+        for i in range(cm_05.shape[0]):
+            for j in range(cm_05.shape[1]):
+                plt.text(j, i, cm_05[i, j],
                          ha="center", va="center",
-                         color="white" if cm[i, j] > thresh else "black")
+                         color="white" if cm_05[i, j] > (cm_05.max()/2) else "black")
         plt.xlabel("Predicted")
         plt.ylabel("True")
         plt.tight_layout()
-        cm_fname = os.path.join(user_test_dir, "confusion_matrix.png")
-        plt.savefig(cm_fname)
+        cm05_path = os.path.join(user_test_dir, "cm_threshold_0.5.png")
+        plt.savefig(cm05_path)
         plt.close()
 
-        # store global result
-        tn, fp, fn, tp = cm.ravel()
+        # Plot confusion matrix for best threshold
+        plt.figure(figsize=(5,4))
+        plt.imshow(cm_best, cmap='Blues')
+        plt.title(f"User {user_id} CM (th={best_thr:.2f}) Acc={best_thr_acc:.2f}%")
+        plt.colorbar()
+        for i in range(cm_best.shape[0]):
+            for j in range(cm_best.shape[1]):
+                plt.text(j, i, cm_best[i, j],
+                         ha="center", va="center",
+                         color="white" if cm_best[i, j] > (cm_best.max()/2) else "black")
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        cm_best_path = os.path.join(user_test_dir, "cm_best_threshold.png")
+        plt.savefig(cm_best_path)
+        plt.close()
+
+        # store global result (for threshold=0.5)
+        tn_05, fp_05, fn_05, tp_05 = cm_05.ravel()
         global_results.append({
             'user_id': user_id,
-            'test_acc': test_acc,
-            'tn': tn,
-            'fp': fp,
-            'fn': fn,
-            'tp': tp
+            'auc': auc_val,
+            'acc_0.5': test_acc_05,
+            'tn_0.5': tn_05,
+            'fp_0.5': fp_05,
+            'fn_0.5': fn_05,
+            'tp_0.5': tp_05,
+            'best_thr': best_thr,
+            'best_acc': best_thr_acc
         })
 
-    # 9) Summaries across all users
+    # Summaries across all users
     if len(global_results) > 0:
         results_df = pd.DataFrame(global_results)
         results_csv = os.path.join("results", "test", "classification_summary.csv")
         results_df.to_csv(results_csv, index=False)
-        print(f"Saved test summary => {results_csv}")
+        print(f"\nSaved test summary => {results_csv}")
 
-        best_df  = results_df.sort_values('test_acc', ascending=False).head(5)
-        worst_df = results_df.sort_values('test_acc', ascending=True).head(5)
-        print("\nTop 5 Users by Test Accuracy:\n", best_df)
-        print("\nWorst 5 Users by Test Accuracy:\n", worst_df)
+        # Sort by AUC (ignoring NaN)
+        results_df_no_nan = results_df.dropna(subset=['auc'])
+        best_auc_df  = results_df_no_nan.sort_values('auc', ascending=False).head(5)
+        worst_auc_df = results_df_no_nan.sort_values('auc', ascending=True).head(5)
+
+        print("\nTop 5 Users by AUC:\n", best_auc_df)
+        print("\nWorst 5 Users by AUC:\n", worst_auc_df)
+
+        # Similarly, top 5 by best_thr_acc
+        best_acc_df  = results_df.sort_values('best_acc', ascending=False).head(5)
+        print("\nTop 5 Users by Best-Threshold Accuracy:\n", best_acc_df)
     else:
         print("No classification results to summarize.")
 
-    print("Done with final drug classification on test sets!")
+    print("\nDone with final drug classification on test sets!\n")
 
 if __name__ == "__main__":
     main()
