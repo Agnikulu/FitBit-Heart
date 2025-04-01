@@ -1,709 +1,438 @@
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-from torch import nn
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import warnings
-from collections import defaultdict
+# train.py
+
 import os
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 
-# Suppress warnings for cleaner output
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import RandomSampler
+from sklearn.model_selection import train_test_split
+
+from models import PersonalizedForecastingModel, partially_unfreeze_backbone
+from utils import (
+    scale_per_user, user_scalers,
+    create_forecasting_samples,
+    ForecastDataset, forecasting_collate_fn,
+    plot_prediction_user,
+    select_samples_for_plotting,
+    WINDOW_SIZE, INPUT_WINDOWS, PREDICT_WINDOWS,
+    inverse_transform  # to revert scaled BPM/Steps
+)
+
 warnings.filterwarnings('ignore')
 
-# ============================
-# 1. Data Loading and Preprocessing
-# ============================
+#################################################
+# 1) Load your private data (minute-level => hourly)
+#################################################
+data_folder = "data/Personalized AI Data/Biosignal"
+csv_files = glob.glob(os.path.join(data_folder, "*.csv"))
+if not csv_files:
+    raise ValueError(f"No CSV files found in {data_folder} (check your path or file extension).")
 
-# Load your DataFrame
-df_daily = pd.read_csv("data/lifesnaps.csv", parse_dates=['date'])
-df_daily.drop("Unnamed: 0", axis=1, inplace=True)
-df = df_daily[["id", "date", "hour", "bpm", "steps"]]
+df_list = []
+for file in csv_files:
+    temp_df = pd.read_csv(file, parse_dates=['time'])
+    # If participant_id missing, parse from filename
+    if 'participant_id' not in temp_df.columns:
+        base = os.path.basename(file)
+        name_no_ext = os.path.splitext(base)[0]
+        if name_no_ext.lower().startswith('p'):
+            pid = name_no_ext[1:]
+        else:
+            pid = name_no_ext
+        temp_df['participant_id'] = int(pid)
+    df_list.append(temp_df)
 
-# Create a datetime column combining date and hour
-df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
-df = df.sort_values(by=['id', 'datetime'])
-df = df.dropna()
-df = df.reset_index(drop=True)
+df_raw = pd.concat(df_list, ignore_index=True)
+df_raw.loc[df_raw['data_type'] == 'hr', 'data_type'] = 'heart_rate'
+df_filtered = df_raw[df_raw['data_type'].isin(['heart_rate','steps'])].copy()
+df_filtered.drop_duplicates(subset=['participant_id','time','data_type'], inplace=True)
 
-# ============================
-# 2. Parameter Definitions
-# ============================
+# Pivot => [id, time, bpm, steps]
+df_pivot = df_filtered.pivot(
+    index=['participant_id','time'],
+    columns='data_type',
+    values='value'
+).reset_index()
 
-WINDOW_SIZE = 6         # Number of time steps in each window
-INPUT_WINDOWS = 24      # Number of past windows
-PREDICT_WINDOWS = 4     # Number of windows to predict (multi-step)
-BATCH_SIZE = 128        # Batch size for training and validation
+df_pivot.rename(columns={'participant_id': 'id', 'heart_rate': 'bpm'}, inplace=True)
+df_pivot['bpm'] = pd.to_numeric(df_pivot['bpm'], errors='coerce')
+df_pivot['steps'] = pd.to_numeric(df_pivot['steps'], errors='coerce')
+df_pivot.dropna(subset=['bpm','steps'], inplace=True)
 
-# ============================
-# 3. Data Normalization
-# ============================
+df_pivot['datetime'] = pd.to_datetime(df_pivot['time'])
+df_pivot['date']     = df_pivot['datetime'].dt.date
+df_pivot['hour']     = df_pivot['datetime'].dt.hour
 
-user_scalers = {}
+df_sensors = df_pivot[['id','datetime','date','hour','bpm','steps']].copy()
+df_sensors = df_sensors.sort_values(by=['id','datetime']).reset_index(drop=True)
 
-def scale_per_user(group):
-    """
-    Applies StandardScaler to BPM and Steps data for each user.
-    Stores scaler parameters for inverse transformations.
-    """
-    user_id = group.name
-    scaler_bpm = StandardScaler()
-    scaler_steps = StandardScaler()
-    group['bpm_scaled'] = scaler_bpm.fit_transform(group['bpm'].values.reshape(-1,1)).flatten()
-    group['steps_scaled'] = scaler_steps.fit_transform(group['steps'].values.reshape(-1,1)).flatten()
-    user_scalers[user_id] = {
-        'bpm_mean': scaler_bpm.mean_[0],
-        'bpm_scale': scaler_bpm.scale_[0],
-        'steps_mean': scaler_steps.mean_[0],
-        'steps_scale': scaler_steps.scale_[0]
-    }
-    return group
+def to_hour_datetime(dateval, hourval):
+    return pd.to_datetime(dateval) + pd.to_timedelta(hourval, unit='H')
 
-# Apply scaling per user
+df_sensors['date'] = pd.to_datetime(df_sensors['date'])
+df_hourly = df_sensors.groupby(['id','date','hour'], as_index=False).agg({
+    'bpm': 'mean',
+    'steps': 'sum'
+})
+df_hourly['datetime'] = df_hourly.apply(
+    lambda r: to_hour_datetime(r['date'], r['hour']), axis=1
+)
+df_hourly = df_hourly[['id','datetime','date','hour','bpm','steps']]
+df_hourly = df_hourly.sort_values(by=['id','datetime']).reset_index(drop=True)
+
+df = df_hourly.copy()
+
+#################################################
+# 2) Apply scaling per user
+#################################################
 df = df.groupby('id').apply(scale_per_user).reset_index(drop=True)
 
-def inverse_transform(user_id, bpm_scaled, steps_scaled):
-    """
-    Reverts scaled BPM and Steps data back to original scale 
-    using stored scaler parameters.
-    """
-    bpm_mean = user_scalers[user_id]['bpm_mean']
-    bpm_scale = user_scalers[user_id]['bpm_scale']
-    steps_mean = user_scalers[user_id]['steps_mean']
-    steps_scale = user_scalers[user_id]['steps_scale']
-    
-    bpm_original = bpm_scaled * bpm_scale + bpm_mean
-    steps_original = steps_scaled * steps_scale + steps_mean
-    return bpm_original, steps_original
+#################################################
+# 3) Create forecasting samples (windowed)
+#################################################
+all_samples = create_forecasting_samples(
+    df,
+    col_bpm='bpm_scaled',
+    col_steps='steps_scaled',
+    window_size=WINDOW_SIZE,
+    input_windows=INPUT_WINDOWS,
+    predict_windows=PREDICT_WINDOWS
+)
 
-# ============================
-# 4. Dataset Preparation
-# ============================
+print(f"Created {len(all_samples)} total samples from {df['id'].nunique()} users.")
 
-def create_data_samples(df):
-    """
-    Creates data samples with multi-step targets:
-      - Breaks time series into non-overlapping windows of size WINDOW_SIZE.
-      - Each sample consists of:
-          Past: INPUT_WINDOWS consecutive windows
-          Future: PREDICT_WINDOWS consecutive windows
-      - Instead of storing a single average for each target window, 
-        we store ALL time points (i.e. shape [WINDOW_SIZE]) for each target window.
-    """
-    data_samples = []
-    user_groups = df.groupby('id')
-    
-    for user_id, group in user_groups:
-        # Break the time series into non-overlapping windows
-        windows = []
-        for i in range(0, len(group), WINDOW_SIZE):
-            window = group.iloc[i:i+WINDOW_SIZE]
-            if len(window) == WINDOW_SIZE:
-                windows.append(window)
-        
-        # Slide over the windows to create samples
-        for i in range(len(windows) - INPUT_WINDOWS - PREDICT_WINDOWS + 1):
-            input_windows = windows[i : i+INPUT_WINDOWS]                   # Past windows
-            target_windows = windows[i+INPUT_WINDOWS : i+INPUT_WINDOWS+PREDICT_WINDOWS]  # Future windows
-            
-            # Gather scaled BPM and Steps for input
-            bpm_input_2d = np.array([w['bpm_scaled'].values for w in input_windows])   # [INPUT_WINDOWS, WINDOW_SIZE]
-            steps_input_2d = np.array([w['steps_scaled'].values for w in input_windows])
-            
-            # Gather scaled targets (BPM & Steps), shape => [PREDICT_WINDOWS, WINDOW_SIZE]
-            bpm_target_2d = np.array([tw['bpm_scaled'].values for tw in target_windows])
-            steps_target_2d = np.array([tw['steps_scaled'].values for tw in target_windows])
-            
-            # Also keep original (unscaled) targets
-            bpm_target_orig_2d = np.array([tw['bpm'].values for tw in target_windows])
-            steps_target_orig_2d = np.array([tw['steps'].values for tw in target_windows])
-            
-            # We do NOT store just an average, 
-            # but the full data for each target window 
-            current_bpm_2d = bpm_target_2d.copy()    
-            current_steps_2d = steps_target_2d.copy()
-            
-            # Store the start datetime of the first target window
-            datetime_val = target_windows[0]['datetime'].values[0]
+#################################################
+# 4) Load the SSL backbone path
+#################################################
+ssl_ckpt_path = "results/saved_models/ssl_backbone.pth"
+if not os.path.exists(ssl_ckpt_path):
+    raise FileNotFoundError(f"Pretrained SSL checkpoint not found at {ssl_ckpt_path}")
 
-            data_samples.append({
-                'bpm_input': bpm_input_2d,            # shape [INPUT_WINDOWS, WINDOW_SIZE]
-                'steps_input': steps_input_2d,        # shape [INPUT_WINDOWS, WINDOW_SIZE]
-                
-                'current_bpm_scaled': current_bpm_2d,       # shape [PREDICT_WINDOWS, WINDOW_SIZE]
-                'current_steps_scaled': current_steps_2d,   # shape [PREDICT_WINDOWS, WINDOW_SIZE]
-                
-                'bpm_target': bpm_target_2d,          # shape [PREDICT_WINDOWS, WINDOW_SIZE]
-                'steps_target': steps_target_2d,
-                'bpm_target_original': bpm_target_orig_2d,
-                'steps_target_original': steps_target_orig_2d,
-                
-                'user_id': user_id,
-                'datetime': datetime_val
-            })
-    return data_samples
+#################################################
+# 5) Loop over each user ID, train a separate model
+#################################################
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Generate data samples
-data_samples = create_data_samples(df)
+num_epochs = 30
+patience = 10
+lr = 1e-4
 
-# ============================
-# 5. Train-Validation Split
-# ============================
+global_stats = []  # to store summary of each user's final results
 
-unique_user_ids = df['id'].unique()
-train_user_ids, val_user_ids = train_test_split(unique_user_ids, test_size=0.2, random_state=42)
+unique_user_ids = sorted(df['id'].unique())
+print(f"Found {len(unique_user_ids)} unique user IDs: {unique_user_ids}")
 
-train_samples = [s for s in data_samples if s['user_id'] in train_user_ids]
-val_samples = [s for s in data_samples if s['user_id'] in val_user_ids]
+for user_id in unique_user_ids:
+    # Create a user-specific directory for results
+    user_dir = os.path.join("results", "train", f"user_{user_id}")
+    os.makedirs(user_dir, exist_ok=True)
 
-# ============================
-# 6. Sampler and DataLoader Setup
-# ============================
+    # Gather that user's samples
+    user_data = [s for s in all_samples if s['user_id'] == user_id]
+    if len(user_data) < 10:
+        print(f"[User {user_id}] Skipping => not enough samples (<10).")
+        continue
 
-def create_user_datasets(data_samples):
-    user_data = defaultdict(list)
-    for idx, s in enumerate(data_samples):
-        user_data[s['user_id']].append(idx)
-    return user_data
+    # Train/val split => 80/20
+    cutoff = int(0.8 * len(user_data))
+    train_data = user_data[:cutoff]
+    val_data   = user_data[cutoff:]
+    if len(val_data) < 1:
+        print(f"[User {user_id}] Skipping => 0 val data.")
+        continue
 
-train_user_data = create_user_datasets(train_samples)
-val_user_data = create_user_datasets(val_samples)
+    # Build dataset
+    train_ds = ForecastDataset(train_data)
+    val_ds   = ForecastDataset(val_data)
 
-class PerUserBatchSampler(Sampler):
-    def __init__(self, user_data, batch_size):
-        self.user_data = user_data
-        self.user_ids = list(user_data.keys())
-        self.batch_size = batch_size
+    # DataLoaders
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=64,
+        shuffle=True,
+        collate_fn=forecasting_collate_fn
+    )
+    val_loader   = DataLoader(
+        val_ds,
+        batch_size=64,
+        shuffle=False,
+        collate_fn=forecasting_collate_fn
+    )
 
-    def __iter__(self):
-        np.random.shuffle(self.user_ids)
-        for uid in self.user_ids:
-            indices = self.user_data[uid]
-            np.random.shuffle(indices)
-            for i in range(0, len(indices), self.batch_size):
-                yield indices[i:i+self.batch_size]
+    # Weighted loss parameters based on user's original data
+    user_df = df[df['id'] == user_id]
+    avg_bpm   = user_df['bpm'].abs().mean() if len(user_df) > 0 else 1.0
+    avg_steps = user_df['steps'].abs().mean() if len(user_df) > 0 else 1.0
+    if avg_bpm == 0: avg_bpm = 1.0
+    if avg_steps == 0: avg_steps = 1.0
+    alpha = 1.0 / avg_bpm
+    beta  = 1.0 / avg_steps
+    tot = alpha + beta
+    alpha /= tot
+    beta  /= tot
 
-    def __len__(self):
-        return sum(
-            len(idx_list) // self.batch_size + (1 if len(idx_list) % self.batch_size != 0 else 0)
-            for idx_list in self.user_data.values()
-        )
+    # Build model & load SSL backbone
+    model = PersonalizedForecastingModel(window_size=WINDOW_SIZE).to(device)
+    ssl_state_dict = torch.load(ssl_ckpt_path, map_location=device)
+    model.load_state_dict(ssl_state_dict, strict=False)
 
-class UserDataset(Dataset):
-    """
-    Each item returns:
-        - Past windows of scaled BPM/Steps
-        - The FULL set of "current" BPM/Steps for each target window 
-          => shape [PREDICT_WINDOWS, WINDOW_SIZE]
-        - The target BPM/Steps => shape [PREDICT_WINDOWS, WINDOW_SIZE]
-        - The unscaled target BPM/Steps => shape [PREDICT_WINDOWS, WINDOW_SIZE]
-        - user_id and datetime
-    """
-    def __init__(self, data_list):
-        self.data_list = data_list
-        
-    def __len__(self):
-        return len(self.data_list)
-    
-    def __getitem__(self, idx):
-        d = self.data_list[idx]
-        
-        bpm_input = torch.tensor(d['bpm_input'], dtype=torch.float32)   # [INPUT_WINDOWS, WINDOW_SIZE]
-        steps_input = torch.tensor(d['steps_input'], dtype=torch.float32)
-        
-        current_bpm_scaled = torch.tensor(d['current_bpm_scaled'], dtype=torch.float32)
-        current_steps_scaled = torch.tensor(d['current_steps_scaled'], dtype=torch.float32)
-        
-        bpm_target = torch.tensor(d['bpm_target'], dtype=torch.float32)  # [PREDICT_WINDOWS, WINDOW_SIZE]
-        steps_target = torch.tensor(d['steps_target'], dtype=torch.float32)
-        
-        bpm_target_original = torch.tensor(d['bpm_target_original'], dtype=torch.float32)
-        steps_target_original = torch.tensor(d['steps_target_original'], dtype=torch.float32)
-        
-        user_id = d['user_id']
-        datetime_val = d['datetime']
-        
-        return (bpm_input, steps_input,
-                current_bpm_scaled, current_steps_scaled,
-                bpm_target, steps_target,
-                user_id,
-                bpm_target_original, steps_target_original,
-                datetime_val)
+    # PARTIAL unfreeze
+    partially_unfreeze_backbone(model, unfreeze_ratio=0.5)
 
-train_dataset = UserDataset(train_samples)
-val_dataset = UserDataset(val_samples)
+    criterion = nn.SmoothL1Loss()
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-train_sampler = PerUserBatchSampler(train_user_data, BATCH_SIZE)
-val_sampler = PerUserBatchSampler(val_user_data, BATCH_SIZE)
+    # We'll track stats like in "pretrain.py"
+    stats = {
+        'epoch': [],
+        'train_loss': [],
+        'val_loss': [],
+        'avg_bpm_error': [],
+        'avg_steps_error': []
+    }
+    validation_errors = []  # store detailed validation errors for each epoch
 
-def collate_fn(batch):
-    bpm_inputs = torch.stack([b[0] for b in batch])             # [B, INPUT_WINDOWS, WINDOW_SIZE]
-    steps_inputs = torch.stack([b[1] for b in batch])           # [B, INPUT_WINDOWS, WINDOW_SIZE]
-    
-    current_bpm_scaled = torch.stack([b[2] for b in batch])     # [B, PREDICT_WINDOWS, WINDOW_SIZE]
-    current_steps_scaled = torch.stack([b[3] for b in batch])
-    
-    bpm_targets = torch.stack([b[4] for b in batch])            # [B, PREDICT_WINDOWS, WINDOW_SIZE]
-    steps_targets = torch.stack([b[5] for b in batch])
-    
-    user_ids = [b[6] for b in batch]
-    bpm_targets_original = [b[7] for b in batch]
-    steps_targets_original = [b[8] for b in batch]
-    datetimes = [b[9] for b in batch]
-    
-    return (bpm_inputs, steps_inputs,
-            current_bpm_scaled, current_steps_scaled,
-            bpm_targets, steps_targets,
-            user_ids,
-            bpm_targets_original, steps_targets_original,
-            datetimes)
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
 
-train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=collate_fn)
-val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, collate_fn=collate_fn)
+    for ep in range(num_epochs):
+        if epochs_no_improve >= patience:
+            print(f"[User {user_id}] Early stopping at epoch={ep+1}")
+            break
 
-# ============================
-# 6A. Compute Weights Based on Average Size
-# ============================
+        # ---- TRAIN ----
+        model.train()
+        sum_train_loss = 0.0
+        for (bpm_in, steps_in,
+             cur_bpm_scl, cur_steps_scl,
+             bpm_t, steps_t,
+             uids,
+             bpm_orig, steps_orig,
+             dtimes) in train_loader:
 
-avg_bpm = df[df['id'].isin(train_user_ids)]['bpm'].abs().mean()
-avg_steps = df[df['id'].isin(train_user_ids)]['steps'].abs().mean()
+            bpm_in   = bpm_in.to(device)
+            steps_in = steps_in.to(device)
+            cur_bpm_scl   = cur_bpm_scl.to(device)
+            cur_steps_scl = cur_steps_scl.to(device)
+            bpm_t   = bpm_t.to(device)
+            steps_t = steps_t.to(device)
 
-alpha = 1.0 / avg_bpm
-beta = 1.0 / avg_steps
-tot = alpha + beta
-alpha /= tot
-beta /= tot
+            optimizer.zero_grad()
+            out_bpm, out_steps = model(bpm_in, steps_in, cur_bpm_scl, cur_steps_scl)
 
-print(f"Weight for BPM loss: {alpha:.4f}")
-print(f"Weight for Steps loss: {beta:.4f}")
+            loss_bpm   = criterion(out_bpm, bpm_t)
+            loss_steps = criterion(out_steps, steps_t)
+            loss       = alpha * loss_bpm + beta * loss_steps
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-# ============================
-# 7. Model Definition
-# ============================
+            sum_train_loss += loss.item()
 
-class ForecastingModel(nn.Module):
-    """
-    Multi-step forecasting model that:
-      - Encodes past BPM & Steps via CNN + LSTM.
-      - For each predicted window, uses the FULL array [WINDOW_SIZE] for 
-        "current" BPM or Steps (rather than a single average).
-      - Aggregates that array (e.g., via a small linear or CNN) before fusion.
-    """
-    def __init__(self):
-        super(ForecastingModel, self).__init__()
-        
-        # CNN + LSTM for BPM (past)
-        self.bpm_cnn = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.bpm_lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True)
-        
-        # CNN + LSTM for Steps (past)
-        self.steps_cnn = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.steps_lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True)
-        
-        # We embed each "current" window of size [WINDOW_SIZE]
-        self.agg_current_steps = nn.Sequential(
-            nn.Linear(WINDOW_SIZE, 16),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.agg_current_bpm = nn.Sequential(
-            nn.Linear(WINDOW_SIZE, 16),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        
-        # For final fusion
-        self.fusion_bpm = nn.Sequential(
-            nn.Linear(256 + 16, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, WINDOW_SIZE)  # => predict 6 time steps
-        )
-        self.fusion_steps = nn.Sequential(
-            nn.Linear(256 + 16, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, WINDOW_SIZE)
-        )
-    
-    def forward(self, bpm_input, steps_input, curr_bpm_windows, curr_steps_windows):
-        """
-        :param bpm_input:      [B, INPUT_WINDOWS, WINDOW_SIZE]
-        :param steps_input:    [B, INPUT_WINDOWS, WINDOW_SIZE]
-        :param curr_bpm_windows:   [B, PREDICT_WINDOWS, WINDOW_SIZE]
-        :param curr_steps_windows: [B, PREDICT_WINDOWS, WINDOW_SIZE]
-        
-        Output shape => [B, PREDICT_WINDOWS, WINDOW_SIZE] each (for BPM, Steps).
-        """
-        B = bpm_input.size(0)
-        
-        # Past BPM => flatten => CNN => LSTM
-        bpm_seq = bpm_input.view(B, -1).unsqueeze(1)   # [B, 1, INPUT_WINDOWS*WINDOW_SIZE]
-        bpm_cnn_out = self.bpm_cnn(bpm_seq)            # [B, 64, ...]
-        bpm_cnn_out = bpm_cnn_out.permute(0, 2, 1)     # [B, ..., 64]
-        bpm_lstm_out, _ = self.bpm_lstm(bpm_cnn_out)   # [B, ..., 128]
-        bpm_hidden = bpm_lstm_out[:, -1, :]            # [B, 128]
-        
-        # Past Steps => flatten => CNN => LSTM
-        steps_seq = steps_input.view(B, -1).unsqueeze(1) 
-        steps_cnn_out = self.steps_cnn(steps_seq)         
-        steps_cnn_out = steps_cnn_out.permute(0, 2, 1)    
-        steps_lstm_out, _ = self.steps_lstm(steps_cnn_out)
-        steps_hidden = steps_lstm_out[:, -1, :]           
-        
-        # Combine hidden states
-        past_features = torch.cat([bpm_hidden, steps_hidden], dim=1)  # [B,256]
-        
-        # We'll produce PREDICT_WINDOWS outputs, each of size WINDOW_SIZE
-        bpm_out_list = []
-        steps_out_list = []
-        
-        for w_idx in range(curr_bpm_windows.size(1)):  # PREDICT_WINDOWS
-            # Gather the "current" window [B, WINDOW_SIZE]
-            curr_bpm_1win = curr_bpm_windows[:, w_idx, :]
-            curr_steps_1win = curr_steps_windows[:, w_idx, :]
-            
-            # embed them
-            curr_bpm_emb = self.agg_current_bpm(curr_bpm_1win)       # [B,16]
-            curr_steps_emb = self.agg_current_steps(curr_steps_1win) # [B,16]
-            
-            # BPM => fuse with steps' embedding
-            bpm_fusion_in = torch.cat([past_features, curr_steps_emb], dim=1)  
-            bpm_pred_1win = self.fusion_bpm(bpm_fusion_in)  # [B,WINDOW_SIZE]
-            
-            # Steps => fuse with bpm's embedding
-            steps_fusion_in = torch.cat([past_features, curr_bpm_emb], dim=1)
-            steps_pred_1win = self.fusion_steps(steps_fusion_in)  # [B,WINDOW_SIZE]
-            
-            bpm_out_list.append(bpm_pred_1win.unsqueeze(1))     
-            steps_out_list.append(steps_pred_1win.unsqueeze(1))
-        
-        # Concatenate across predicted windows
-        bpm_pred_final = torch.cat(bpm_out_list, dim=1)    # [B,PREDICT_WINDOWS,WINDOW_SIZE]
-        steps_pred_final = torch.cat(steps_out_list, dim=1)# [B,PREDICT_WINDOWS,WINDOW_SIZE]
-        
-        return bpm_pred_final, steps_pred_final
+        scheduler.step()
+        avg_train_loss = sum_train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
 
-# Check GPU
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-model = ForecastingModel().to(device)
+        # ---- VALIDATION ----
+        model.eval()
+        sum_val_loss = 0.0
+        total_bpm_err = 0.0
+        total_steps_err = 0.0
+        validation_errors_epoch = []
 
-# ============================
-# 8. Training Setup
-# ============================
+        with torch.no_grad():
+            for (bpm_in, steps_in,
+                 cur_bpm_scl, cur_steps_scl,
+                 bpm_t, steps_t,
+                 uids,
+                 bpm_orig, steps_orig,
+                 dtimes) in val_loader:
 
-# --- CHANGED HERE: use MSE loss instead of L1Loss ---
-criterion = nn.SmoothL1Loss()
+                bpm_in   = bpm_in.to(device)
+                steps_in = steps_in.to(device)
+                cur_bpm_scl   = cur_bpm_scl.to(device)
+                cur_steps_scl = cur_steps_scl.to(device)
+                bpm_t   = bpm_t.to(device)
+                steps_t = steps_t.to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+                out_bpm_scl, out_steps_scl = model(bpm_in, steps_in, cur_bpm_scl, cur_steps_scl)
 
-num_epochs = 100
-patience = 15
-best_val_loss = float('inf')
-epochs_no_improve = 0
-early_stop = False
+                loss_bpm   = criterion(out_bpm_scl, bpm_t)
+                loss_steps = criterion(out_steps_scl, steps_t)
+                val_loss   = alpha * loss_bpm + beta * loss_steps
+                sum_val_loss += val_loss.item()
 
-save_dir = 'results/saved_models'
-os.makedirs(save_dir, exist_ok=True)
-model_save_path = os.path.join(save_dir, 'forecasting_backbone.pth')
+                # For BPM/Steps error in original scale
+                out_bpm_np   = out_bpm_scl.cpu().numpy()
+                out_steps_np = out_steps_scl.cpu().numpy()
+                bpm_t_np     = bpm_t.cpu().numpy()
+                steps_t_np   = steps_t.cpu().numpy()
 
-stats = {
-    'epoch': [],
-    'train_loss': [],
-    'val_loss': [],
-    'avg_bpm_error': [],
-    'avg_steps_error': []
-}
+                batch_size = len(uids)
+                for i in range(batch_size):
+                    uid = uids[i]
+                    # shape => [PREDICT_WINDOWS, WINDOW_SIZE]
+                    pred_bpm_2d   = out_bpm_np[i]
+                    pred_steps_2d = out_steps_np[i]
+                    true_bpm_2d   = bpm_t_np[i]
+                    true_steps_2d = steps_t_np[i]
 
-validation_errors = []
+                    # Flatten to do inverse transform
+                    pred_bpm_1d   = pred_bpm_2d.flatten()
+                    pred_steps_1d = pred_steps_2d.flatten()
+                    true_bpm_1d   = true_bpm_2d.flatten()
+                    true_steps_1d = true_steps_2d.flatten()
 
-for epoch in range(num_epochs):
-    if early_stop:
-        break
-    
-    # Training
-    model.train()
-    epoch_loss = 0.0
-    
-    for (bpm_input, steps_input,
-         curr_bpm_scaled, curr_steps_scaled,
-         bpm_target, steps_target,
-         user_ids,
-         bpm_target_original, steps_target_original,
-         datetimes) in train_loader:
-        
-        bpm_input = bpm_input.to(device)
-        steps_input = steps_input.to(device)
-        curr_bpm_scaled = curr_bpm_scaled.to(device)    # [B,PREDICT_WINDOWS,WINDOW_SIZE]
-        curr_steps_scaled = curr_steps_scaled.to(device)# [B,PREDICT_WINDOWS,WINDOW_SIZE]
-        
-        bpm_target = bpm_target.to(device)      # [B,PREDICT_WINDOWS,WINDOW_SIZE]
-        steps_target = steps_target.to(device)
-        
-        optimizer.zero_grad()
-        bpm_pred, steps_pred = model(bpm_input, steps_input,
-                                     curr_bpm_scaled, curr_steps_scaled)
-        
-        # Weighted MSE in scaled space
-        loss_bpm = criterion(bpm_pred, bpm_target)
-        loss_steps = criterion(steps_pred, steps_target)
-        loss = alpha * loss_bpm + beta * loss_steps
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        epoch_loss += loss.item()
-    
-    scheduler.step()
-    avg_train_loss = epoch_loss / len(train_loader)
-    
-    # Validation
-    model.eval()
-    val_loss = 0.0
-    total_bpm_error = 0.0
-    total_steps_error = 0.0
-    validation_errors_epoch = []
-    
-    with torch.no_grad():
-        for (bpm_input, steps_input,
-             curr_bpm_scaled, curr_steps_scaled,
-             bpm_target, steps_target,
-             user_ids,
-             bpm_target_original, steps_target_original,
-             datetimes) in val_loader:
-            
-            bpm_input = bpm_input.to(device)
-            steps_input = steps_input.to(device)
-            curr_bpm_scaled = curr_bpm_scaled.to(device)
-            curr_steps_scaled = curr_steps_scaled.to(device)
-            bpm_target = bpm_target.to(device)
-            steps_target = steps_target.to(device)
-            
-            bpm_pred_scaled, steps_pred_scaled = model(bpm_input, steps_input,
-                                                       curr_bpm_scaled, curr_steps_scaled)
-            
-            # Validation loss in scaled space
-            loss_bpm = criterion(bpm_pred_scaled, bpm_target)
-            loss_steps = criterion(steps_pred_scaled, steps_target)
-            loss = alpha * loss_bpm + beta * loss_steps
-            val_loss += loss.item()
-            
-            # For error in original scale (MAE in BPM/Steps)
-            bpm_pred_np = bpm_pred_scaled.cpu().numpy()       # [B,PREDICT_WINDOWS,WINDOW_SIZE]
-            steps_pred_np = steps_pred_scaled.cpu().numpy()
-            bpm_target_np = bpm_target.cpu().numpy()
-            steps_target_np = steps_target.cpu().numpy()
-            
-            for i in range(len(user_ids)):
-                uid = user_ids[i]
-                
-                bpm_pred_2d = bpm_pred_np[i]     # shape [PREDICT_WINDOWS,WINDOW_SIZE]
-                steps_pred_2d = steps_pred_np[i]
-                
-                bpm_true_2d = bpm_target_np[i]
-                steps_true_2d = steps_target_np[i]
-                
-                # Flatten to do inverse transform
-                bpm_pred_1d = bpm_pred_2d.flatten()
-                steps_pred_1d = steps_pred_2d.flatten()
-                bpm_true_1d = bpm_true_2d.flatten()
-                steps_true_1d = steps_true_2d.flatten()
-                
-                # Inverse
-                bpm_pred_unscaled_1d, steps_pred_unscaled_1d = inverse_transform(
-                    uid, bpm_pred_1d, steps_pred_1d
-                )
-                bpm_true_unscaled_1d, steps_true_unscaled_1d = inverse_transform(
-                    uid, bpm_true_1d, steps_true_1d
-                )
-                
-                # MAE in original units
-                bpm_error = np.mean(np.abs(bpm_pred_unscaled_1d - bpm_true_unscaled_1d))
-                steps_error = np.mean(np.abs(steps_pred_unscaled_1d - steps_true_unscaled_1d))
-                total_bpm_error += bpm_error
-                total_steps_error += steps_error
-                
-                validation_errors_epoch.append({
-                    'user_id': uid,
-                    'bpm_error': bpm_error,
-                    'steps_error': steps_error,
-                    'bpm_pred': bpm_pred_unscaled_1d.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
-                    'steps_pred': steps_pred_unscaled_1d.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
-                    'bpm_true': bpm_true_unscaled_1d.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
-                    'steps_true': steps_true_unscaled_1d.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
-                    'datetime': datetimes[i]
-                })
-    
-    avg_val_loss = val_loss / len(val_loader)
-    avg_bpm_error = total_bpm_error / len(val_loader.dataset)
-    avg_steps_error = total_steps_error / len(val_loader.dataset)
-    
-    stats['epoch'].append(epoch+1)
-    stats['train_loss'].append(avg_train_loss)
-    stats['val_loss'].append(avg_val_loss)
-    stats['avg_bpm_error'].append(avg_bpm_error)
-    stats['avg_steps_error'].append(avg_steps_error)
-    
-    validation_errors.extend(validation_errors_epoch)
-    
-    # Early stopping
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        epochs_no_improve = 0
-        torch.save(model.state_dict(), model_save_path)
-        print(f"Epoch {epoch+1}: Validation loss improved. Model saved.")
-    else:
-        epochs_no_improve += 1
-        print(f"Epoch {epoch+1}: No improvement in validation loss.")
-    
-    if epochs_no_improve >= patience:
-        print(f"Early stopping triggered after {patience} epochs with no improvement.")
-        early_stop = True
-    
-    print(f"Epoch {epoch+1}/{num_epochs}, "
-          f"Train Loss: {avg_train_loss:.4f}, "
-          f"Val Loss: {avg_val_loss:.4f}, "
-          f"BPM Error: {avg_bpm_error:.2f}, "
-          f"Steps Error: {avg_steps_error:.2f}")
+                    # Revert scaling
+                    bpm_pred_unsc, steps_pred_unsc = inverse_transform(uid, pred_bpm_1d, pred_steps_1d)
+                    bpm_true_unsc, steps_true_unsc = inverse_transform(uid, true_bpm_1d, true_steps_1d)
 
-# ============================
-# 9. Save Training Statistics
-# ============================
-results_dir = 'results/train'
-os.makedirs(results_dir, exist_ok=True)
+                    # MAE
+                    bpm_err   = np.mean(np.abs(bpm_pred_unsc - bpm_true_unsc))
+                    steps_err = np.mean(np.abs(steps_pred_unsc - steps_true_unsc))
 
-stats_df = pd.DataFrame(stats)
-stats_df.to_csv(os.path.join(results_dir, "stats.csv"), index=False)
+                    total_bpm_err   += bpm_err
+                    total_steps_err += steps_err
 
-# ============================
-# 10. Generate Charts
-# ============================
-plt.figure(figsize=(10, 6))
-plt.plot(stats_df['epoch'], stats_df['train_loss'], label='Train Loss')
-plt.plot(stats_df['epoch'], stats_df['val_loss'], label='Val Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Training and Validation Loss per Epoch (MSE)')
-plt.legend()
-plt.savefig(os.path.join(results_dir, 'loss_per_epoch.png'))
-plt.show()
+                    validation_errors_epoch.append({
+                        'user_id': uid,
+                        'epoch': ep+1,
+                        'bpm_error': bpm_err,
+                        'steps_error': steps_err,
+                        'bpm_pred':   bpm_pred_unsc.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
+                        'steps_pred': steps_pred_unsc.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
+                        'bpm_true':   bpm_true_unsc.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
+                        'steps_true': steps_true_unsc.reshape(PREDICT_WINDOWS, WINDOW_SIZE),
+                        'datetime': dtimes[i]
+                    })
 
-plt.figure(figsize=(10, 6))
-plt.plot(stats_df['epoch'], stats_df['avg_bpm_error'], label='BPM Error')
-plt.xlabel('Epoch')
-plt.ylabel('MAE (BPM)')
-plt.title('BPM Error per Epoch')
-plt.legend()
-plt.savefig(os.path.join(results_dir, 'bpm_error_per_epoch.png'))
-plt.show()
+        avg_val_loss = sum_val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+        # Compute average error across this user's validation set
+        val_dataset_size = len(val_ds)
+        if val_dataset_size > 0:
+            avg_bpm_error   = total_bpm_err / val_dataset_size
+            avg_steps_error = total_steps_err / val_dataset_size
+        else:
+            avg_bpm_error   = 0.0
+            avg_steps_error = 0.0
 
-plt.figure(figsize=(10, 6))
-plt.plot(stats_df['epoch'], stats_df['avg_steps_error'], label='Steps Error')
-plt.xlabel('Epoch')
-plt.ylabel('MAE (Steps)')
-plt.title('Steps Error per Epoch')
-plt.legend()
-plt.savefig(os.path.join(results_dir, 'steps_error_per_epoch.png'))
-plt.show()
+        stats['epoch'].append(ep+1)
+        stats['train_loss'].append(avg_train_loss)
+        stats['val_loss'].append(avg_val_loss)
+        stats['avg_bpm_error'].append(avg_bpm_error)
+        stats['avg_steps_error'].append(avg_steps_error)
 
-print(f"Training complete. Figures saved in '{results_dir}'.")
+        validation_errors.extend(validation_errors_epoch)
 
-# ============================
-# 11. Analyze Validation Errors
-# ============================
-validation_errors_df = pd.DataFrame(validation_errors)
-validation_errors_df['total_error'] = validation_errors_df['bpm_error'] + validation_errors_df['steps_error']
+        print(f"[User {user_id}] Epoch={ep+1}/{num_epochs}, "
+              f"TrainLoss={avg_train_loss:.4f}, ValLoss={avg_val_loss:.4f}, "
+              f"BPM_Err={avg_bpm_error:.2f}, Steps_Err={avg_steps_error:.2f}")
 
-user_error_df = validation_errors_df.groupby('user_id')['total_error'].mean().reset_index()
-user_error_df_sorted = user_error_df.sort_values(by='total_error', ascending=True)
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
-top_N = 10
-best_users = user_error_df_sorted.head(top_N)
-worst_users = user_error_df_sorted.tail(top_N)
+    # Save final stats for this user in their subdirectory
+    user_stats_df = pd.DataFrame(stats)
+    user_stats_csv = os.path.join(user_dir, "stats.csv")
+    user_stats_df.to_csv(user_stats_csv, index=False)
 
-print(f"Best Users:\n{best_users}\n")
-print(f"Worst Users:\n{worst_users}\n")
+    # Save detailed validation errors
+    validation_csv = os.path.join(user_dir, "validation_errors.csv")
+    validation_df = pd.DataFrame(validation_errors)
+    validation_df.to_csv(validation_csv, index=False)
 
-analysis_dir = 'results/train/analysis'
-os.makedirs(analysis_dir, exist_ok=True)
+    # Plot training vs. validation loss
+    plt.figure(figsize=(10,6))
+    plt.plot(user_stats_df['epoch'], user_stats_df['train_loss'], label='Train Loss')
+    plt.plot(user_stats_df['epoch'], user_stats_df['val_loss'], label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'User {user_id} Train/Val Loss')
+    plt.legend()
+    loss_plot_path = os.path.join(user_dir, "loss.png")
+    plt.savefig(loss_plot_path)
+    plt.close()
 
-def plot_prediction_user(user_id, user_samples, plot_type, PREDICT_WINDOWS, WINDOW_SIZE):
-    """
-    Plots the true vs predicted BPM and Steps for a user when predicting multiple future windows.
-    Each window is fully included in the "current" features.
-    """
-    for i, sample in enumerate(user_samples):
-        bpm_pred_2d = sample['bpm_pred']
-        steps_pred_2d = sample['steps_pred']
-        bpm_true_2d = sample['bpm_true']
-        steps_true_2d = sample['steps_true']
-        datetime = sample['datetime']
-        
-        bpm_pred_1d = bpm_pred_2d.flatten()
-        steps_pred_1d = steps_pred_2d.flatten()
-        bpm_true_1d = bpm_true_2d.flatten()
-        steps_true_1d = steps_true_2d.flatten()
-        
-        total_time = len(bpm_pred_1d)  # = PREDICT_WINDOWS * WINDOW_SIZE
-        
-        fig, axs = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'User: {user_id} | Sample {i+1} | DateTime: {datetime}', fontsize=16)
-        
-        # BPM
-        axs[0,0].plot(range(total_time), bpm_true_1d, label='True BPM', marker='o')
-        axs[0,0].plot(range(total_time), bpm_pred_1d, label='Predicted BPM', marker='x')
-        axs[0,0].set_title('BPM Prediction vs True')
-        axs[0,0].legend()
-        
-        # Steps
-        axs[0,1].plot(range(total_time), steps_true_1d, label='True Steps', marker='o')
-        axs[0,1].plot(range(total_time), steps_pred_1d, label='Pred Steps', marker='x', color='orange')
-        axs[0,1].set_title('Steps Prediction vs True')
-        axs[0,1].legend()
-        
-        # BPM error
-        axs[1,0].bar(range(total_time), np.abs(bpm_true_1d - bpm_pred_1d))
-        axs[1,0].set_title('BPM Absolute Error')
-        
-        # Steps error
-        axs[1,1].bar(range(total_time), np.abs(steps_true_1d - steps_pred_1d), color='orange')
-        axs[1,1].set_title('Steps Absolute Error')
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        fname = f"{plot_type}_user_{user_id}_sample_{i+1}.png"
-        plt.savefig(os.path.join(analysis_dir, fname))
-        plt.close()
-        
-        print(f"Saved plot for user={user_id}, sample={i+1} at {fname}")
+    # Plot BPM error
+    plt.figure(figsize=(10,6))
+    plt.plot(user_stats_df['epoch'], user_stats_df['avg_bpm_error'], label='BPM Error')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE (BPM)')
+    plt.title(f'User {user_id} BPM Error per Epoch')
+    plt.legend()
+    bpm_plot_path = os.path.join(user_dir, "bpm_error.png")
+    plt.savefig(bpm_plot_path)
+    plt.close()
 
-def select_samples_for_plotting(validation_errors_df, user_id, num_samples=2):
-    user_samples = validation_errors_df[validation_errors_df['user_id'] == user_id].to_dict(orient='records')
-    return user_samples[:num_samples]
+    # Plot Steps error
+    plt.figure(figsize=(10,6))
+    plt.plot(user_stats_df['epoch'], user_stats_df['avg_steps_error'], label='Steps Error')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE (Steps)')
+    plt.title(f'User {user_id} Steps Error per Epoch')
+    plt.legend()
+    steps_plot_path = os.path.join(user_dir, "steps_error.png")
+    plt.savefig(steps_plot_path)
+    plt.close()
 
-for idx, row in best_users.iterrows():
-    uid = row['user_id']
-    samples_to_plot = select_samples_for_plotting(validation_errors_df, uid, num_samples=2)
-    plot_prediction_user(uid, samples_to_plot, "best", PREDICT_WINDOWS, WINDOW_SIZE)
+    # Save final model in the user's directory
+    personalized_path = os.path.join(user_dir, "personalized_ssl.pt")
+    torch.save(model.state_dict(), personalized_path)
+    print(f"[User {user_id}] => saved model => {personalized_path}")
 
-for idx, row in worst_users.iterrows():
-    uid = row['user_id']
-    samples_to_plot = select_samples_for_plotting(validation_errors_df, uid, num_samples=2)
-    plot_prediction_user(uid, samples_to_plot, "worst", PREDICT_WINDOWS, WINDOW_SIZE)
+    # Analyze best/worst windows from final epoch
+    final_epoch = user_stats_df['epoch'].max()
+    final_df = validation_df[validation_df['epoch'] == final_epoch].copy()
+    if len(final_df) > 0:
+        final_df['total_error'] = final_df['bpm_error'] + final_df['steps_error']
+        final_df_sorted = final_df.sort_values('total_error', ascending=True)
+        topN = 5
+        best_samples = final_df_sorted.head(topN)
+        worst_samples = final_df_sorted.tail(topN)
+
+        # Create an analysis subdirectory inside the user's folder
+        analysis_dir = os.path.join(user_dir, "analysis")
+        os.makedirs(analysis_dir, exist_ok=True)
+
+        # Plot best samples
+        for i, row in best_samples.iterrows():
+            sample_to_plot = [dict(row)]  # wrapped in a list so that plot_prediction_user can handle it
+            plot_prediction_user(
+                user_id, sample_to_plot, "best_finetune", PREDICT_WINDOWS, WINDOW_SIZE, analysis_dir
+            )
+
+        # Plot worst samples
+        for i, row in worst_samples.iterrows():
+            sample_to_plot = [dict(row)]
+            plot_prediction_user(
+                user_id, sample_to_plot, "worst_finetune", PREDICT_WINDOWS, WINDOW_SIZE, analysis_dir
+            )
+
+    # Store user-level summary for global comparison
+    global_stats.append({
+        'user_id': user_id,
+        'best_val_loss': best_val_loss,
+        'final_epoch': user_stats_df['epoch'].iloc[-1],
+        'final_bpm_error': user_stats_df['avg_bpm_error'].iloc[-1],
+        'final_steps_error': user_stats_df['avg_steps_error'].iloc[-1]
+    })
+
+# Summarize across all users
+global_df = pd.DataFrame(global_stats)
+if len(global_df) > 0:
+    summary_csv = os.path.join("results", "train", "personalized_finetune_summary.csv")
+    global_df.to_csv(summary_csv, index=False)
+    print("All user training done. Summary =>", summary_csv)
+    print(global_df)
+else:
+    print("No users were trained. Possibly no data matched the criteria.")

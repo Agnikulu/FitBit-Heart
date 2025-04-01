@@ -1,679 +1,480 @@
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
-from torch import nn
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import warnings
-from collections import defaultdict
+# test.py
+
 import os
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
+
+from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import confusion_matrix, accuracy_score
 
-# Suppress warnings for cleaner output
+from models import DrugClassifier
+from utils import scale_per_user, user_scalers, WINDOW_SIZE  # from your `utils.py`
+
 warnings.filterwarnings('ignore')
 
-# ============================
-# 1. Data Loading and Preprocessing
-# ============================
 
-# Load your new DataFrame with 'heartCondition'
-df = pd.read_csv("data/myheartcounts.csv", parse_dates=['date'])
+##############################################
+# 1) LOADING & PREPROCESSING HOURLY DATA + LABELS
+##############################################
+"""
+We assume:
+ - You have your minute-level sensor data in /Biosignal
+ - You have label files in /Label that indicate usage events
+ - We merge them into an hourly 'df_merged' => columns [id, datetime, bpm, steps, label]
+ - We do a final grouping by user + scaling => columns [bpm_scaled, steps_scaled, label]
+"""
+def load_and_merge_data():
+    # 1A) Load hospital data, pivot to hourly BPM/Steps
+    data_folder = "/home/agnik/uh-internship/data/Personalized AI Data/Biosignal"
+    csv_files = glob.glob(os.path.join(data_folder, "*.csv"))
 
-# Preprocess data
-df['datetime'] = pd.to_datetime(df['date']) + pd.to_timedelta(df['hour'], unit='h')
-df = df.sort_values(by=['id', 'datetime'])
-df = df.dropna()
-df = df.reset_index(drop=True)
+    df_list = []
+    for file in csv_files:
+        tmp = pd.read_csv(file, parse_dates=['time'])
+        if 'participant_id' not in tmp.columns:
+            base = os.path.basename(file)
+            name_no_ext = os.path.splitext(base)[0]
+            if name_no_ext.lower().startswith('p'):
+                pid = name_no_ext[1:]
+            else:
+                pid = name_no_ext
+            tmp['participant_id'] = int(pid)
+        df_list.append(tmp)
 
-# ============================
-# 2. Parameter Definitions
-# ============================
+    df_raw = pd.concat(df_list, ignore_index=True)
+    df_raw.loc[df_raw['data_type'] == 'hr','data_type'] = 'heart_rate'
 
-WINDOW_SIZE = 2        # Number of time steps in each window
-INPUT_WINDOWS = 3      # Number of input windows to consider for prediction
-PREDICT_WINDOW = 1     # Number of windows to predict
-BATCH_SIZE = 128       # Batch size for training and validation
+    # Filter for heart_rate & steps
+    df_filt = df_raw[df_raw['data_type'].isin(['heart_rate','steps'])].copy()
+    df_filt = df_filt.drop_duplicates(subset=['participant_id','time','data_type'])
 
-# ============================
-# 3. Data Normalization
-# ============================
+    # Pivot => [id, time, bpm, steps]
+    df_pivot = df_filt.pivot(
+        index=['participant_id','time'],
+        columns='data_type',
+        values='value'
+    ).reset_index()
 
-user_scalers = {}
+    df_pivot.rename(columns={'participant_id':'id','heart_rate':'bpm'}, inplace=True)
+    df_pivot['bpm'] = pd.to_numeric(df_pivot['bpm'], errors='coerce')
+    df_pivot['steps'] = pd.to_numeric(df_pivot['steps'], errors='coerce')
+    df_pivot.dropna(subset=['bpm','steps'], inplace=True)
 
-def scale_per_user(group):
+    # Add date/hour
+    df_pivot['datetime'] = pd.to_datetime(df_pivot['time'])
+    df_pivot['date'] = df_pivot['datetime'].dt.date
+    df_pivot['hour'] = df_pivot['datetime'].dt.hour
+
+    df_sensors = df_pivot[['id','datetime','date','hour','bpm','steps']].copy()
+    df_sensors = df_sensors.sort_values(by=['id','datetime']).reset_index(drop=True)
+
+    # Hourly aggregation
+    def to_hour_datetime(dateval, hourval):
+        return pd.to_datetime(dateval) + pd.to_timedelta(hourval, unit='H')
+
+    df_sensors['date'] = pd.to_datetime(df_sensors['date'])
+    df_hourly = df_sensors.groupby(['id','date','hour'], as_index=False).agg({
+        'bpm':'mean',
+        'steps':'sum'
+    })
+    df_hourly['datetime'] = df_hourly.apply(
+        lambda row: to_hour_datetime(row['date'], row['hour']), axis=1
+    )
+    df_hourly = df_hourly[['id','datetime','date','hour','bpm','steps']]
+    df_hourly = df_hourly.sort_values(by=['id','datetime']).reset_index(drop=True)
+
+    # 1B) Load usage label files from /Label
+    labels_dir = "/home/agnik/uh-internship/data/Personalized AI Data/Label"
+    all_label_rows = []
+
+    subdirs = glob.glob(os.path.join(labels_dir, "ID*"))
+    for sd in subdirs:
+        pid_str = os.path.basename(sd)
+        p_id = int(pid_str.replace("ID", ""))  # e.g. "ID14" => 14
+
+        label_files = glob.glob(os.path.join(sd, "*.csv")) + glob.glob(os.path.join(sd, "*.xlsx"))
+        for lf in label_files:
+            base = os.path.basename(lf).lower()
+            df_label = None
+            if lf.endswith(".csv"):
+                try:
+                    df_label = pd.read_csv(lf)
+                except:
+                    continue
+            elif lf.endswith(".xlsx"):
+                try:
+                    df_label = pd.read_excel(lf)
+                except:
+                    continue
+
+            if df_label is None or df_label.empty:
+                continue
+
+            # check known time col
+            time_col = None
+            if 'hawaii_use_time' in df_label.columns:
+                time_col = 'hawaii_use_time'
+            elif 'hawaii_createdat_time' in df_label.columns:
+                time_col = 'hawaii_createdat_time'
+            else:
+                continue
+
+            df_label[time_col] = pd.to_datetime(df_label[time_col], errors='coerce')
+            df_label.dropna(subset=[time_col], inplace=True)
+
+            for idx, row in df_label.iterrows():
+                label_str = str(row.get('crave_use_none_label','')).lower().strip()
+                event_dt  = row[time_col]
+                if label_str in ['use','crave']:
+                    label_val = 1
+                else:
+                    label_val = 0
+
+                all_label_rows.append({
+                    'id': p_id,
+                    'datetime': event_dt,
+                    'label': label_val
+                })
+
+    df_labels = pd.DataFrame(all_label_rows)
+    df_labels.dropna(subset=['datetime'], inplace=True)
+    df_labels = df_labels.sort_values(['id','datetime']).reset_index(drop=True)
+
+    df_labels['date'] = df_labels['datetime'].dt.date
+    df_labels['hour'] = df_labels['datetime'].dt.hour
+    df_labels['date'] = pd.to_datetime(df_labels['date'])
+    df_labels_hour = df_labels.groupby(['id','date','hour'], as_index=False)['label'].max()
+    df_labels_hour['datetime'] = df_labels_hour.apply(
+        lambda row: to_hour_datetime(row['date'], row['hour']), axis=1
+    )
+    df_labels_hour = df_labels_hour[['id','datetime','label']].sort_values(['id','datetime'])
+    df_labels_hour.reset_index(drop=True, inplace=True)
+
+    # Merge sensors with labels
+    df_sensors_hour = df_hourly.copy()
+    df_sensors_hour['datetime'] = df_sensors_hour['datetime'].dt.tz_localize(None)
+    df_labels_hour['datetime'] = df_labels_hour['datetime'].dt.tz_localize(None)
+
+    df_merged = pd.merge(df_sensors_hour, df_labels_hour, on=['id','datetime'], how='left')
+    df_merged['label'] = df_merged['label'].fillna(0).astype(int)
+    return df_merged
+
+
+##############################################
+# 2) CREATE Classification Dataset (Windowed)
+##############################################
+class CravingDataset(Dataset):
     """
-    Applies StandardScaler to BPM and Steps data for each user.
-    Stores scaler parameters for inverse transformations.
+    Each item => (bpm_input, steps_input, user_id, label).
+    We'll define chunk windows of length=WINDOW_SIZE for features,
+    label=1 if any usage in that chunk, else 0.
     """
-    user_id = group.name
-    scaler_bpm = StandardScaler()
-    scaler_steps = StandardScaler()
-    group['bpm_scaled'] = scaler_bpm.fit_transform(group['bpm'].values.reshape(-1,1)).flatten()
-    group['steps_scaled'] = scaler_steps.fit_transform(group['steps'].values.reshape(-1,1)).flatten()
-    user_scalers[user_id] = {
-        'bpm_mean': scaler_bpm.mean_[0],
-        'bpm_scale': scaler_bpm.scale_[0],
-        'steps_mean': scaler_steps.mean_[0],
-        'steps_scale': scaler_steps.scale_[0]
-    }
-    return group
+    def __init__(self, data_list):
+        self.data_list = data_list
 
-# Apply scaling per user
-df = df.groupby('id').apply(scale_per_user).reset_index(drop=True)
-
-# Function to inverse transform scaled data
-def inverse_transform(user_id, bpm_scaled, steps_scaled):
-    """
-    Reverts scaled BPM and Steps data back to original scale using stored scaler parameters.
-    """
-    bpm_mean = user_scalers[user_id]['bpm_mean']
-    bpm_scale = user_scalers[user_id]['bpm_scale']
-    steps_mean = user_scalers[user_id]['steps_mean']
-    steps_scale = user_scalers[user_id]['steps_scale']
-    bpm_original = bpm_scaled * bpm_scale + bpm_mean
-    steps_original = steps_scaled * steps_scale + steps_mean
-    return bpm_original, steps_original
-
-# ============================
-# 4. Dataset Preparation
-# ============================
-
-class UserDataset(Dataset):
-    """
-    PyTorch Dataset for user-specific time series data.
-    Includes heart condition label for classification.
-    """
-    def __init__(self, data_list, user_labels):
-        self.data = data_list
-        self.user_labels = user_labels  # Dictionary mapping user_id to label
-                
     def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        sample = self.data[idx]
-        bpm_input = torch.tensor(sample['bpm_input'], dtype=torch.float32)
-        steps_input = torch.tensor(sample['steps_input'], dtype=torch.float32)
-        user_id = sample['user_id']
-        heart_condition = torch.tensor(self.user_labels[user_id], dtype=torch.float32)  # Binary label
-        return bpm_input, steps_input, user_id, heart_condition
+        return len(self.data_list)
 
-def create_data_samples(df):
+    def __getitem__(self, idx):
+        d = self.data_list[idx]
+        # shape => [WINDOW_SIZE]
+        bpm_in   = torch.tensor(d['bpm_input'], dtype=torch.float32)
+        steps_in = torch.tensor(d['steps_input'], dtype=torch.float32)
+        label    = torch.tensor(d['label'], dtype=torch.float32)
+        uid      = d['id']
+        return bpm_in, steps_in, uid, label
+
+
+def create_classification_samples(df_merged, window_size=6):
     """
-    Creates data samples by sliding a window of INPUT_WINDOWS to predict the PREDICT_WINDOW.
-    Ensures that windows are non-overlapping and ordered per user.
+    For each (id):
+     1) sort by datetime,
+     2) break into non-overlapping windows of size=window_size,
+     3) label=1 if ANY row in that chunk => label=1,
+     4) store [bpm_scaled, steps_scaled].
     """
     data_samples = []
-    user_groups = df.groupby('id')
-    for user_id, group in user_groups:
-        windows = []
-        # Create non-overlapping windows
-        for i in range(0, len(group), WINDOW_SIZE):
-            window = group.iloc[i:i+WINDOW_SIZE]
-            if len(window) == WINDOW_SIZE:
-                windows.append(window)
-        # Create samples with INPUT_WINDOWS and PREDICT_WINDOW
-        for i in range(len(windows) - INPUT_WINDOWS - PREDICT_WINDOW + 1):
-            input_windows = windows[i:i+INPUT_WINDOWS]
-            target_window = windows[i+INPUT_WINDOWS]
+    for uid, group in df_merged.groupby('id'):
+        group = group.sort_values('datetime').reset_index(drop=True)
+
+        # Break into non-overlapping windows
+        chunked = []
+        for i in range(0, len(group), window_size):
+            chunk = group.iloc[i:i+window_size]
+            if len(chunk) == window_size:
+                chunked.append(chunk)
+
+        for ch in chunked:
+            chunk_label = 1 if (ch['label'].max() == 1) else 0
+            if 'bpm_scaled' in ch.columns:
+                bpm_arr   = ch['bpm_scaled'].values
+                steps_arr = ch['steps_scaled'].values
+            else:
+                # fallback
+                bpm_arr   = ch['bpm'].values
+                steps_arr = ch['steps'].values
+
             data_samples.append({
-                'bpm_input': np.array([w['bpm_scaled'].values for w in input_windows]),
-                'steps_input': np.array([w['steps_scaled'].values for w in input_windows]),
-                'user_id': user_id
+                'id': uid,
+                'bpm_input': bpm_arr,
+                'steps_input': steps_arr,
+                'label': chunk_label,
+                'datetime_start': ch['datetime'].iloc[0],
+                'datetime_end':   ch['datetime'].iloc[-1]
             })
     return data_samples
 
-# ============================
-# 5. Balancing the Dataset
-# ============================
 
-# Extract unique users with their heartCondition
-user_labels_df = df.groupby('id')['heartCondition'].first().reset_index()
+##############################################
+# 3) MAIN SCRIPT
+##############################################
+def main():
+    # 1) load + merge
+    df_merged = load_and_merge_data()
+    print("Merged shape:", df_merged.shape)
+    print("Columns:", df_merged.columns.tolist())
 
-# Ensure that 'heartCondition' is consistent per user
-assert user_labels_df['heartCondition'].nunique() == 2 or user_labels_df['heartCondition'].nunique() == 1, "Inconsistent heartCondition labels per user."
+    # 2) scale => 'bpm_scaled','steps_scaled'
+    df_merged = df_merged.groupby('id').apply(scale_per_user).reset_index(drop=True)
 
-# Separate users by class
-heart_condition_users = user_labels_df[user_labels_df['heartCondition'] == True]['id'].tolist()
-no_heart_condition_users = user_labels_df[user_labels_df['heartCondition'] == False]['id'].tolist()
+    # 3) create classification samples
+    data_samples = create_classification_samples(df_merged, window_size=WINDOW_SIZE)
+    print("Created classification samples:", len(data_samples))
 
-# Determine number of users to undersample
-num_heart_condition = len(heart_condition_users)
-num_no_heart_condition = len(no_heart_condition_users)
+    # We'll store final test results for each user
+    global_results = []
 
-if num_no_heart_condition > num_heart_condition:
-    no_heart_condition_users = train_test_split(no_heart_condition_users, 
-                                               train_size=num_heart_condition, 
-                                               random_state=42)[0]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    unique_ids = sorted(df_merged['id'].unique())
 
-# Combine balanced user lists
-balanced_users = heart_condition_users + no_heart_condition_users
-balanced_labels = {user_id:1.0 for user_id in heart_condition_users}
-balanced_labels.update({user_id:0.0 for user_id in no_heart_condition_users})
+    for user_id in unique_ids:
+        # Create a user-specific directory for test results
+        user_test_dir = os.path.join("results", "test", f"user_{user_id}")
+        os.makedirs(user_test_dir, exist_ok=True)
 
-# Filter the dataframe to include only balanced users
-df_balanced = df[df['id'].isin(balanced_users)].reset_index(drop=True)
+        user_data = [s for s in data_samples if s['id'] == user_id]
+        if len(user_data) < 15:
+            print(f"[User {user_id}] Skipping => not enough classification samples (<15).")
+            continue
 
-# ============================
-# 6. Train-Validation-Test Split
-# ============================
+        # 4) train/val/test split => e.g. 70/15/15
+        total_count = len(user_data)
+        train_cut = int(0.70 * total_count)
+        val_cut   = int(0.85 * total_count)
+        user_train = user_data[:train_cut]
+        user_val   = user_data[train_cut:val_cut]
+        user_test  = user_data[val_cut:]
 
-# Split users into train, val, test (e.g., 70%, 15%, 15%)
-train_users, temp_users = train_test_split(
-    balanced_users, test_size=0.3, stratify=[balanced_labels[user] for user in balanced_users], random_state=42)
+        if len(user_val) < 1 or len(user_test) < 1:
+            print(f"[User {user_id}] Skipping => not enough val/test data.")
+            continue
 
-val_users, test_users = train_test_split(
-    temp_users, test_size=0.5, stratify=[balanced_labels[user] for user in temp_users], random_state=42)
+        # Build dataset
+        train_ds = CravingDataset(user_train)
+        val_ds   = CravingDataset(user_val)
+        test_ds  = CravingDataset(user_test)
 
-# Create label dictionaries for each split
-train_labels = {user_id:balanced_labels[user_id] for user_id in train_users}
-val_labels = {user_id:balanced_labels[user_id] for user_id in val_users}
-test_labels = {user_id:balanced_labels[user_id] for user_id in test_users}
+        from torch.utils.data import RandomSampler
+        train_loader = DataLoader(train_ds, batch_size=32, sampler=RandomSampler(train_ds))
+        val_loader   = DataLoader(val_ds, batch_size=32, sampler=RandomSampler(val_ds))
+        test_loader  = DataLoader(test_ds, batch_size=32)
 
-# ============================
-# 7. Create Data Samples
-# ============================
+        # 5) Build classifier => load user forecasting checkpoint from saved models
+        # Expect model to be stored in "results/saved_models/user_{user_id}/drug_classifier.pt"
+        user_model_dir = os.path.join("results", "train", f"user_{user_id}")
+        user_ckpt = os.path.join(user_model_dir, "personalized_ssl.pt")
+        if not os.path.exists(user_ckpt):
+            print(f"[User {user_id}] No saved model checkpoint at {user_ckpt} => skip classification.")
+            continue
 
-# Generate data samples
-data_samples = create_data_samples(df_balanced)
+        classifier = DrugClassifier(window_size=WINDOW_SIZE).to(device)
 
-# Assign samples to splits based on user_id
-train_samples = [sample for sample in data_samples if sample['user_id'] in train_users]
-val_samples = [sample for sample in data_samples if sample['user_id'] in val_users]
-test_samples = [sample for sample in data_samples if sample['user_id'] in test_users]
+        # Load forecasting weights into classifier's CNN+LSTM
+        pers_sd = torch.load(user_ckpt, map_location=device)
+        classifier.load_state_dict(pers_sd, strict=False)
 
-# ============================
-# 8. Sampler and DataLoader Setup
-# ============================
+        # Freeze the CNN+LSTM, only train classifier head
+        for name, param in classifier.named_parameters():
+            if 'classifier' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
-def create_user_datasets(data_samples):
-    """
-    Organizes data samples by user for the sampler.
-    """
-    user_data = defaultdict(list)
-    for idx, sample in enumerate(data_samples):
-        user_data[sample['user_id']].append(idx)
-    return user_data
+        # Weighted BCE
+        labels_train = [x['label'] for x in user_train]
+        pos_count = sum(labels_train)
+        neg_count = len(labels_train) - pos_count
+        if pos_count == 0:
+            pos_weight_val = 1.0
+        else:
+            pos_weight_val = neg_count / float(pos_count)
 
-# Organize training, validation, and test samples by user
-train_user_data = create_user_datasets(train_samples)
-val_user_data = create_user_datasets(val_samples)
-test_user_data = create_user_datasets(test_samples)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val], dtype=torch.float).to(device))
+        optimizer = torch.optim.Adam(classifier.classifier.parameters(), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        num_epochs = 20
+        patience = 5
 
-class PerUserBatchSampler(Sampler):
-    """
-    Custom sampler to yield batches of samples per user.
-    """
-    def __init__(self, user_data, batch_size):
-        self.user_data = user_data
-        self.user_ids = list(user_data.keys())
-        self.batch_size = batch_size
-
-    def __iter__(self):
-        np.random.shuffle(self.user_ids)  # Shuffle users each epoch
-        for user_id in self.user_ids:
-            user_samples = self.user_data[user_id]
-            np.random.shuffle(user_samples)  # Shuffle samples within the user
-            for i in range(0, len(user_samples), self.batch_size):
-                yield user_samples[i:i + self.batch_size]
-
-    def __len__(self):
-        return sum(len(indices) // self.batch_size + (1 if len(indices) % self.batch_size != 0 else 0) 
-                   for indices in self.user_data.values())
-
-# Instantiate datasets
-train_dataset = UserDataset(train_samples, train_labels)
-val_dataset = UserDataset(val_samples, val_labels)
-test_dataset = UserDataset(test_samples, test_labels)
-
-# Instantiate samplers
-train_sampler = PerUserBatchSampler(train_user_data, batch_size=BATCH_SIZE)
-val_sampler = PerUserBatchSampler(val_user_data, batch_size=BATCH_SIZE)
-test_sampler = PerUserBatchSampler(test_user_data, batch_size=BATCH_SIZE)
-
-# Define collate function
-def collate_fn(batch):
-    """
-    Custom collate function to handle batching of samples.
-    """
-    bpm_inputs = torch.stack([s[0] for s in batch])
-    steps_inputs = torch.stack([s[1] for s in batch])
-    user_ids = [s[2] for s in batch]
-    heart_conditions = torch.stack([s[3] for s in batch])  # Binary labels
-    return bpm_inputs, steps_inputs, user_ids, heart_conditions
-
-# Create DataLoaders
-train_loader = DataLoader(train_dataset, batch_sampler=train_sampler, collate_fn=collate_fn)
-val_loader = DataLoader(val_dataset, batch_sampler=val_sampler, collate_fn=collate_fn)
-test_loader = DataLoader(test_dataset, batch_sampler=test_sampler, collate_fn=collate_fn)
-
-# ============================
-# 9. Compute Weights Based on Average Size
-# ============================
-
-# Calculate the average absolute value of BPM and steps in the training set
-avg_bpm = df_balanced[df_balanced['id'].isin(train_users)]['bpm'].abs().mean()
-avg_steps = df_balanced[df_balanced['id'].isin(train_users)]['steps'].abs().mean()
-
-# Set weights inversely proportional to the average size
-alpha = 1.0 / avg_bpm
-beta = 1.0 / avg_steps
-
-# Normalize weights so that alpha + beta = 1
-total = alpha + beta
-alpha /= total
-beta /= total
-
-print(f"Weight for BPM loss: {alpha:.4f}")
-print(f"Weight for Steps loss: {beta:.4f}")
-
-# ============================
-# 10. Updated Model Definition without Decoders
-# ============================
-
-class ClassifierModel(nn.Module):
-    """
-    Forecasting model with separate 1D CNN and LSTM encoders for BPM and Steps,
-    followed by a classifier for heart condition prediction.
-    Decoders are removed to focus solely on classification.
-    """
-    def __init__(self, backbone_path="results/saved_models/forecasting_backbone.pth"):
-        super(ClassifierModel, self).__init__()
-        # CNN Encoder for BPM
-        self.bpm_cnn = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        # LSTM Encoder for BPM
-        self.bpm_lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True)
-        
-        # CNN Encoder for Steps
-        self.steps_cnn = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        # LSTM Encoder for Steps
-        self.steps_lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True)
-        
-        # Fully Connected Layers for Fusion
-        self.fc = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        
-        # Classifier for Heart Condition
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1)  # Output logit for binary classification
-        )
-        
-        # Load pretrained backbone weights if provided
-        if backbone_path and os.path.exists(backbone_path):
-            self.load_backbone(backbone_path)
-            print(f"Loaded backbone weights from {backbone_path}")
-        
-    def load_backbone(self, backbone_path):
-        """
-        Loads the backbone weights (forecasting model) from a saved state dict,
-        excluding the classifier layers to avoid size mismatches.
-        """
-        backbone_state = torch.load(backbone_path, map_location='cpu')
-        
-        # Exclude decoder parameters if any
-        backbone_state = {k: v for k, v in backbone_state.items() if not k.startswith('bpm_decoder.') 
-                                                       and not k.startswith('steps_decoder.') 
-                                                       and not k.startswith('classifier.')}
-        
-        # Load the state dict with strict=False to ignore missing keys (classifier layers)
-        self.load_state_dict(backbone_state, strict=False)
-        
-    def forward(self, bpm_input, steps_input):
-        """
-        Forward pass for the classification model.
-        """
-        # Reshape BPM input: [batch_size, INPUT_WINDOWS, WINDOW_SIZE] -> [batch_size, 1, INPUT_WINDOWS * WINDOW_SIZE]
-        bpm_seq = bpm_input.view(bpm_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 6]
-        
-        # CNN Encoder for BPM
-        bpm_cnn_output = self.bpm_cnn(bpm_seq)  # Shape: [B, 64, 6]
-        bpm_cnn_output = bpm_cnn_output.permute(0, 2, 1)  # Shape: [B, 6, 64]
-        
-        # LSTM Encoder for BPM
-        bpm_lstm_output, _ = self.bpm_lstm(bpm_cnn_output)  # Shape: [B, 6, 128]
-        bpm_hidden = bpm_lstm_output[:, -1, :]  # Shape: [B, 128]
-        
-        # Reshape Steps input similarly: [B, 1, 6]
-        steps_seq = steps_input.view(steps_input.size(0), -1).contiguous().unsqueeze(1)  # Shape: [B, 1, 6]
-        
-        # CNN Encoder for Steps
-        steps_cnn_output = self.steps_cnn(steps_seq)  # Shape: [B, 64, 6]
-        steps_cnn_output = steps_cnn_output.permute(0, 2, 1)  # Shape: [B, 6, 64]
-        
-        # LSTM Encoder for Steps
-        steps_lstm_output, _ = self.steps_lstm(steps_cnn_output)  # Shape: [B, 6, 128]
-        steps_hidden = steps_lstm_output[:, -1, :]  # Shape: [B, 128]
-        
-        # Concatenate the hidden states from BPM and Steps
-        combined_features = torch.cat((bpm_hidden, steps_hidden), dim=1)  # Shape: [B, 256]
-        
-        # Fully Connected Layers for Fusion
-        fused_features = self.fc(combined_features)  # Shape: [B, 128]
-        
-        # Classifier
-        heart_condition_logit = self.classifier(fused_features)  # Shape: [B, 1]
-        
-        return heart_condition_logit
-
-# ============================
-# 11. Model Initialization and Loading
-# ============================
-
-# Check if GPU is available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Using device: {device}')
-
-# Instantiate the model and move it to the device
-backbone_path = 'results/saved_models/forecasting_backbone.pth'  # Update path if different
-model = ClassifierModel(backbone_path=backbone_path).to(device)
-
-# ============================
-# 12. Training Setup
-# ============================
-
-# Define the loss functions
-classification_criterion = nn.BCEWithLogitsLoss() # Binary Cross-Entropy Loss for classification
-
-# Initialize the optimizer (fine-tuning all parameters)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # Added weight_decay for regularization
-
-# Initialize the learning rate scheduler
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
-
-num_epochs = 100
-
-# ============================
-# 13. Training and Validation Loop
-# ============================
-
-# Early Stopping Parameters
-patience = 15
-best_val_loss = float('inf')
-epochs_no_improve = 0
-early_stop = False
-
-# Directory to save the best model
-save_dir = 'results/saved_models'
-os.makedirs(save_dir, exist_ok=True)
-model_save_path = os.path.join(save_dir, 'heart_condition_classifier.pth')
-
-# Initialize statistics dictionary
-stats = {
-    'epoch': [],
-    'train_classification_loss': [],
-    'val_classification_loss': [],
-    'classification_accuracy': []
-}
-
-for epoch in range(num_epochs):
-    if early_stop:
-        break
-    
-    # ---------------------
-    # Training Phase
-    # ---------------------
-    model.train()
-    epoch_classification_loss = 0.0
-    correct_predictions = 0
-    total_predictions = 0
-    for bpm_input, steps_input, user_id, heart_condition in train_loader:
-        optimizer.zero_grad()
-        
-        # Move tensors to the device
-        bpm_input = bpm_input.to(device)            # Shape: [B, INPUT_WINDOWS, WINDOW_SIZE]
-        steps_input = steps_input.to(device)        # Shape: [B, INPUT_WINDOWS, WINDOW_SIZE]
-        heart_condition = heart_condition.to(device) # Shape: [B]
-        
-        # Forward pass
-        heart_condition_logit = model(bpm_input, steps_input).squeeze(-1)  # Shape: [B]
-        
-        # Compute classification loss
-        classification_loss = classification_criterion(heart_condition_logit, heart_condition)
-        
-        # Backward pass and optimization
-        classification_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        epoch_classification_loss += classification_loss.item()
-        
-        # Compute training accuracy
-        predictions = torch.sigmoid(heart_condition_logit) >= 0.5
-        correct_predictions += (predictions.float() == heart_condition).sum().item()
-        total_predictions += heart_condition.size(0)
-    
-    # Update learning rate
-    scheduler.step()
-    
-    # ---------------------
-    # Validation Phase
-    # ---------------------
-    model.eval()
-    val_classification_loss = 0.0
-    val_correct_predictions = 0
-    val_total_predictions = 0
-    with torch.no_grad():
-        for bpm_input, steps_input, user_id, heart_condition in val_loader:
-            # Move tensors to the device
-            bpm_input = bpm_input.to(device)
-            steps_input = steps_input.to(device)
-            heart_condition = heart_condition.to(device)
-            
-            # Forward pass
-            heart_condition_logit = model(bpm_input, steps_input).squeeze(-1)  # Shape: [B]
-            
-            # Compute classification loss
-            classification_loss = classification_criterion(heart_condition_logit, heart_condition)
-            val_classification_loss += classification_loss.item()
-            
-            # Compute validation accuracy
-            predictions = torch.sigmoid(heart_condition_logit) >= 0.5
-            val_correct_predictions += (predictions.float() == heart_condition).sum().item()
-            val_total_predictions += heart_condition.size(0)
-    
-    # ---------------------
-    # Calculate Average Losses and Accuracies
-    # ---------------------
-    avg_train_classification_loss = epoch_classification_loss / len(train_loader)
-    avg_val_classification_loss = val_classification_loss / len(val_loader)
-    train_accuracy = (correct_predictions / total_predictions) * 100
-    val_accuracy = (val_correct_predictions / val_total_predictions) * 100
-    
-    # ---------------------
-    # Check for Improvement
-    # ---------------------
-    if avg_val_classification_loss < best_val_loss:
-        best_val_loss = avg_val_classification_loss
+        best_val_loss = float('inf')
         epochs_no_improve = 0
-        # Save the best model
-        torch.save(model.state_dict(), model_save_path)
+
+        # We'll store train/val stats
+        STATS = {
+            'epoch': [],
+            'train_loss': [],
+            'val_loss': [],
+            'val_acc': []
+        }
+
+        # 6) Classification training loop
+        for epoch in range(num_epochs):
+            if epochs_no_improve >= patience:
+                print(f"[User {user_id}] Early stop at epoch={epoch+1}")
+                break
+
+            # -- TRAIN --
+            classifier.train()
+            sum_train_loss = 0.0
+            for (bpm_in, steps_in, pids, labels) in train_loader:
+                bpm_in   = bpm_in.to(device)
+                steps_in = steps_in.to(device)
+                labels   = labels.to(device)
+
+                optimizer.zero_grad()
+                logits = classifier(bpm_in, steps_in)
+                loss   = criterion(logits, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+                optimizer.step()
+                sum_train_loss += loss.item()
+
+            scheduler.step()
+            avg_train_loss = sum_train_loss / len(train_loader)
+
+            # -- VAL --
+            classifier.eval()
+            sum_val_loss = 0.0
+            val_preds = []
+            val_true  = []
+            with torch.no_grad():
+                for (bpm_in, steps_in, pids, labels) in val_loader:
+                    bpm_in   = bpm_in.to(device)
+                    steps_in = steps_in.to(device)
+                    labels   = labels.to(device)
+
+                    logits = classifier(bpm_in, steps_in)
+                    loss = criterion(logits, labels)
+                    sum_val_loss += loss.item()
+
+                    probs = torch.sigmoid(logits)
+                    preds = (probs >= 0.5).float()
+                    val_preds.extend(preds.cpu().numpy())
+                    val_true.extend(labels.cpu().numpy())
+
+            avg_val_loss = sum_val_loss / len(val_loader)
+            val_preds = np.array(val_preds)
+            val_true  = np.array(val_true)
+            val_acc   = (val_preds == val_true).mean() * 100.0
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                epochs_no_improve = 0
+                # save best classifier for this user in their test directory
+                best_path = os.path.join(user_test_dir, "drug_classifier.pth")
+                torch.save(classifier.state_dict(), best_path)
+            else:
+                epochs_no_improve += 1
+
+            STATS['epoch'].append(epoch+1)
+            STATS['train_loss'].append(avg_train_loss)
+            STATS['val_loss'].append(avg_val_loss)
+            STATS['val_acc'].append(val_acc)
+
+            print(f"[User {user_id}] Epoch={epoch+1}/{num_epochs}, "
+                  f"TrainLoss={avg_train_loss:.4f}, ValLoss={avg_val_loss:.4f}, ValAcc={val_acc:.2f}%")
+
+        # 7) Save train/val stats in user test directory
+        stats_df = pd.DataFrame(STATS)
+        stats_path = os.path.join(user_test_dir, "train_stats.csv")
+        stats_df.to_csv(stats_path, index=False)
+
+        # 8) Load best model => final test evaluation
+        classifier.load_state_dict(torch.load(best_path, map_location=device))
+        classifier.eval()
+
+        test_preds = []
+        test_true  = []
+        with torch.no_grad():
+            for (bpm_in, steps_in, pids, labels) in DataLoader(test_ds, batch_size=32):
+                bpm_in   = bpm_in.to(device)
+                steps_in = steps_in.to(device)
+                labels   = labels.to(device)
+
+                logits = classifier(bpm_in, steps_in)
+                probs = torch.sigmoid(logits)
+                preds = (probs >= 0.5).float()
+
+                test_preds.extend(preds.cpu().numpy())
+                test_true.extend(labels.cpu().numpy())
+
+        test_preds = np.array(test_preds, dtype=int)
+        test_true  = np.array(test_true,  dtype=int)
+        test_acc   = (test_preds == test_true).mean() * 100.0
+
+        cm = confusion_matrix(test_true, test_preds, labels=[0, 1])
+        print(f"[User {user_id}] => TEST Accuracy: {test_acc:.2f}%")
+        print("Confusion Matrix (Test):")
+        print(cm)
+
+        # Plot confusion matrix in user test directory
+        plt.figure(figsize=(5,4))
+        plt.imshow(cm, cmap='Blues')
+        plt.title(f"User {user_id} Confusion Matrix (Test)")
+        plt.colorbar()
+        thresh = cm.max() / 2
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, cm[i, j],
+                         ha="center", va="center",
+                         color="white" if cm[i, j] > thresh else "black")
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        cm_fname = os.path.join(user_test_dir, "confusion_matrix.png")
+        plt.savefig(cm_fname)
+        plt.close()
+
+        # store global result
+        tn, fp, fn, tp = cm.ravel()
+        global_results.append({
+            'user_id': user_id,
+            'test_acc': test_acc,
+            'tn': tn,
+            'fp': fp,
+            'fn': fn,
+            'tp': tp
+        })
+
+    # 9) Summaries across all users
+    if len(global_results) > 0:
+        results_df = pd.DataFrame(global_results)
+        results_csv = os.path.join("results", "test", "classification_summary.csv")
+        results_df.to_csv(results_csv, index=False)
+        print(f"Saved test summary => {results_csv}")
+
+        best_df  = results_df.sort_values('test_acc', ascending=False).head(5)
+        worst_df = results_df.sort_values('test_acc', ascending=True).head(5)
+        print("\nTop 5 Users by Test Accuracy:\n", best_df)
+        print("\nWorst 5 Users by Test Accuracy:\n", worst_df)
     else:
-        epochs_no_improve += 1
-    
-    # Check if early stopping should be triggered
-    if epochs_no_improve >= patience:
-        print(f'Early stopping triggered after {patience} epochs with no improvement.')
-        early_stop = True
-    
-    # ---------------------
-    # Log epoch statistics
-    # ---------------------
-    stats['epoch'].append(epoch + 1)
-    stats['train_classification_loss'].append(avg_train_classification_loss)
-    stats['val_classification_loss'].append(avg_val_classification_loss)
-    stats['classification_accuracy'].append(val_accuracy)
-    
-    # ---------------------
-    # Print epoch statistics
-    # ---------------------
-    print(f'Epoch {epoch+1}/{num_epochs}, '
-          f'Train Classification Loss: {avg_train_classification_loss:.4f}, '
-          f'Val Classification Loss: {avg_val_classification_loss:.4f}, '
-          f'Validation Accuracy: {val_accuracy:.2f}%')
+        print("No classification results to summarize.")
 
-# ============================
-# 14. Save Training Statistics and Generate Plots
-# ============================
+    print("Done with final drug classification on test sets!")
 
-# Create a directory to save the figures
-results_dir = 'results/test'
-os.makedirs(results_dir, exist_ok=True)
-
-# Convert statistics to DataFrame
-stats_df = pd.DataFrame(stats)
-
-# Save DataFrame
-stats_df.to_csv(os.path.join(results_dir, "training_stats.csv"), index=False)
-
-# Plot and save Classification Loss
-plt.figure(figsize=(10, 6))
-plt.plot(stats_df['epoch'], stats_df['train_classification_loss'], label='Train Classification Loss')
-plt.plot(stats_df['epoch'], stats_df['val_classification_loss'], label='Validation Classification Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Classification Loss per Epoch')
-plt.legend()
-plt.savefig(os.path.join(results_dir, 'classification_loss.png'))
-plt.close()
-
-# Plot and save Classification Accuracy
-plt.figure(figsize=(10, 6))
-plt.plot(stats_df['epoch'], stats_df['classification_accuracy'], label='Validation Classification Accuracy')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy (%)')
-plt.title('Validation Classification Accuracy per Epoch')
-plt.legend()
-plt.savefig(os.path.join(results_dir, 'classification_accuracy.png'))
-plt.close()
-
-print(f"\nTraining complete. Figures saved in '{results_dir}'.")
-
-# ============================
-# 15. Evaluation on Test Set 
-# ============================
-
-# Initialize test statistics dictionary
-test_stats = {
-    "Metric": ["Test Classification Loss", "Classification Accuracy (%)"],
-    "Value": []
-}
-
-# Initialize lists for confusion matrix
-all_true_labels = []
-all_pred_labels = []
-
-# Variables to track test performance
-test_classification_loss = 0.0
-total_classification_correct = 0
-total_samples = 0
-
-model.eval()
-
-with torch.no_grad():
-    for bpm_input, steps_input, user_id, heart_condition in test_loader:
-        # Move tensors to device
-        bpm_input, steps_input = bpm_input.to(device), steps_input.to(device)
-        heart_condition = heart_condition.to(device)
-        
-        # Forward pass
-        heart_condition_logit = model(bpm_input, steps_input).squeeze(-1)  # Shape: [B]
-        
-        # Compute classification loss
-        classification_loss = classification_criterion(heart_condition_logit, heart_condition)
-        test_classification_loss += classification_loss.item()
-        
-        # Compute predictions
-        predictions = torch.sigmoid(heart_condition_logit) >= 0.5
-        total_classification_correct += (predictions.float() == heart_condition).sum().item()
-        total_samples += heart_condition.size(0)
-        
-        # Collect labels for confusion matrix
-        all_true_labels.extend(heart_condition.cpu().numpy())
-        all_pred_labels.extend(predictions.cpu().numpy())
-
-# Calculate averages
-avg_test_classification_loss = test_classification_loss / len(test_loader)
-classification_accuracy = (total_classification_correct / total_samples) * 100
-
-# Update test statistics
-test_stats["Value"] = [
-    avg_test_classification_loss,
-    classification_accuracy
-]
-
-# Create a DataFrame for test statistics
-test_stats_df = pd.DataFrame(test_stats)
-test_stats_file = os.path.join(results_dir, "test_summary.csv")
-test_stats_df.to_csv(test_stats_file, index=False)
-
-print("\nTest Phase Summary Statistics:")
-print(test_stats_df)
-
-# ============================
-# 16. Confusion Matrix and Plot
-# ============================
-
-# Generate confusion matrix
-cm = confusion_matrix(all_true_labels, all_pred_labels)
-
-# Create confusion matrix DataFrame for better readability
-cm_df = pd.DataFrame(
-    cm, 
-    index=['Actual No Heart Condition', 'Actual Heart Condition'],
-    columns=['Predicted No Heart Condition', 'Predicted Heart Condition']
-)
-
-# Save confusion matrix as CSV
-confusion_matrix_file = os.path.join(results_dir, "confusion_matrix.csv")
-cm_df.to_csv(confusion_matrix_file)
-
-# Plot confusion matrix as a heatmap
-plt.figure(figsize=(8, 6))
-plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.colorbar()
-
-# Add labels and ticks
-tick_marks = np.arange(len(cm_df))
-plt.xticks(tick_marks, cm_df.columns, rotation=45)
-plt.yticks(tick_marks, cm_df.index)
-
-# Add values to the heatmap
-thresh = cm.max() / 2.0
-for i, j in np.ndindex(cm.shape):
-    plt.text(j, i, format(cm[i, j], "d"),
-             horizontalalignment="center",
-             color="white" if cm[i, j] > thresh else "black")
-
-plt.ylabel("True Label")
-plt.xlabel("Predicted Label")
-plt.tight_layout()
-
-# Save the confusion matrix plot
-confusion_matrix_plot_file = os.path.join(results_dir, "confusion_matrix.png")
-plt.savefig(confusion_matrix_plot_file)
-plt.close()
-
-print(f"\nConfusion matrix saved as CSV to {confusion_matrix_file} and as PNG to {confusion_matrix_plot_file}.")
+if __name__ == "__main__":
+    main()
