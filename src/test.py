@@ -12,11 +12,14 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import RandomSampler
 from sklearn.metrics import confusion_matrix, roc_auc_score
+
+# Make sure you have these modules in your project:
+# models.py => DrugClassifier
+# utils.py  => scale_per_user, user_scalers, WINDOW_SIZE
 from models import DrugClassifier
-from utils import scale_per_user, user_scalers, WINDOW_SIZE  # from your `utils.py`
+from utils import scale_per_user, user_scalers, WINDOW_SIZE
 
 warnings.filterwarnings('ignore')
-
 
 ##############################################
 # 1) LOADING & PREPROCESSING HOURLY DATA + LABELS
@@ -28,9 +31,10 @@ We assume:
  - We merge them into an hourly 'df_merged' => columns [id, datetime, bpm, steps, label]
  - We do a final grouping by user + scaling => columns [bpm_scaled, steps_scaled, label]
 """
+
 def load_and_merge_data():
-    # 1A) Load hospital data, pivot to hourly BPM/Steps
-    data_folder = "/home/agnik/uh-internship/data/Personalized AI Data/Biosignal"
+    # 1A) Load sensor data, pivot to hourly BPM/Steps
+    data_folder = "data/Personalized AI Data/Biosignal"
     csv_files = glob.glob(os.path.join(data_folder, "*.csv"))
     if not csv_files:
         raise ValueError(f"No CSV files found in '{data_folder}'.")
@@ -52,7 +56,7 @@ def load_and_merge_data():
     df_raw = pd.concat(df_list, ignore_index=True)
     df_raw.loc[df_raw['data_type'] == 'hr','data_type'] = 'heart_rate'
 
-    # Filter for heart_rate & steps
+    # Filter for heart_rate & steps only
     df_filt = df_raw[df_raw['data_type'].isin(['heart_rate','steps'])].copy()
     df_filt = df_filt.drop_duplicates(subset=['participant_id','time','data_type'])
 
@@ -92,7 +96,7 @@ def load_and_merge_data():
     df_hourly = df_hourly.sort_values(by=['id','datetime']).reset_index(drop=True)
 
     # 1B) Load usage label files from /Label
-    labels_dir = "/home/agnik/uh-internship/data/Personalized AI Data/Label"
+    labels_dir = "data/Personalized AI Data/Label"
     all_label_rows = []
 
     subdirs = glob.glob(os.path.join(labels_dir, "ID*"))
@@ -117,7 +121,7 @@ def load_and_merge_data():
             if df_label is None or df_label.empty:
                 continue
 
-            # check known time col
+            # Check known time col
             time_col = None
             if 'hawaii_use_time' in df_label.columns:
                 time_col = 'hawaii_use_time'
@@ -174,7 +178,7 @@ class CravingDataset(Dataset):
     """
     Each item => (bpm_input, steps_input, user_id, label).
     We'll define chunk windows of length=WINDOW_SIZE for features,
-    label=1 if any usage in that chunk, else 0.
+    label=1 if ANY row in that chunk => label=1.
     """
     def __init__(self, data_list):
         self.data_list = data_list
@@ -228,6 +232,46 @@ def create_classification_samples(df_merged, window_size=6):
 
 
 ##############################################
+# HELPER: BALANCE DATASET (Downsample)
+##############################################
+import random
+
+def balance_train_data(train_list, mode='downsample'):
+    """
+    Balances the training set to have equal positives and negatives by downsampling the majority.
+    Returns balanced_train, extras (the 'extra' majority samples that got removed).
+    """
+    pos_list = [d for d in train_list if d['label'] == 1]
+    neg_list = [d for d in train_list if d['label'] == 0]
+
+    n_pos = len(pos_list)
+    n_neg = len(neg_list)
+    if n_pos == 0 or n_neg == 0:
+        # no balancing possible
+        return train_list, []
+
+    # pick the smaller group size
+    target_size = min(n_pos, n_neg)
+    extras = []
+
+    if mode == 'downsample':
+        if n_pos < n_neg:
+            random.shuffle(neg_list)
+            neg_down = neg_list[:target_size]
+            extras = neg_list[target_size:]
+            balanced_data = pos_list + neg_down
+        else:
+            random.shuffle(pos_list)
+            pos_down = pos_list[:target_size]
+            extras = pos_list[target_size:]
+            balanced_data = pos_down + neg_list
+
+    # Shuffle final
+    random.shuffle(balanced_data)
+    return balanced_data, extras
+
+
+##############################################
 # 3) MAIN SCRIPT
 ##############################################
 def main():
@@ -271,8 +315,13 @@ def main():
             print(f"[User {user_id}] Skipping => not enough val/test data.")
             continue
 
+        # 4B) Downsample training data, then add extras to test
+        balanced_train, extras = balance_train_data(user_train, mode='downsample')
+        user_test += extras
+        random.shuffle(user_test)
+
         # Build dataset
-        train_ds = CravingDataset(user_train)
+        train_ds = CravingDataset(balanced_train)
         val_ds   = CravingDataset(user_val)
         test_ds  = CravingDataset(user_test)
 
@@ -287,7 +336,6 @@ def main():
             print(f"[User {user_id}] No saved model checkpoint at {user_ckpt} => skip classification.")
             continue
 
-        from models import DrugClassifier
         classifier = DrugClassifier(window_size=WINDOW_SIZE).to(device)
 
         # Load forecasting weights into classifier's CNN+LSTM
@@ -301,18 +349,8 @@ def main():
             else:
                 param.requires_grad = False
 
-        # Weighted BCE
-        labels_train = [x['label'] for x in user_train]
-        pos_count = sum(labels_train)
-        neg_count = len(labels_train) - pos_count
-        if pos_count == 0:
-            pos_weight_val = 1.0
-        else:
-            pos_weight_val = neg_count / float(pos_count)
-
-        criterion = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pos_weight_val], dtype=torch.float).to(device)
-        )
+        # Because we manually balanced the training data, we can use standard BCE
+        criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.Adam(classifier.classifier.parameters(), lr=1e-3)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
         num_epochs = 20
@@ -404,109 +442,98 @@ def main():
         stats_path = os.path.join(user_test_dir, "train_stats.csv")
         stats_df.to_csv(stats_path, index=False)
 
-        # 8) Load best model => final test evaluation
+        # 8) Load best model => pick threshold from VAL => final test
         classifier.load_state_dict(torch.load(best_path, map_location=device))
         classifier.eval()
 
-        # We'll collect predicted probabilities and labels
+        # -- FIRST: Evaluate on val to pick threshold
+        val_probs_all = []
+        val_labels_all = []
+        with torch.no_grad():
+            for (bpm_in, steps_in, pids, labels) in val_loader:
+                bpm_in   = bpm_in.to(device)
+                steps_in = steps_in.to(device)
+                labels   = labels.cpu().numpy()
+                logits   = classifier(bpm_in, steps_in)
+                probs    = torch.sigmoid(logits).cpu().numpy()
+
+                val_probs_all.extend(probs)
+                val_labels_all.extend(labels)
+
+        val_probs_all = np.array(val_probs_all)
+        val_labels_all = np.array(val_labels_all)
+
+        thresholds = np.linspace(0.0, 1.0, 101)
+        best_thr_acc_val = 0.0
+        best_thr = 0.5
+        for thr in thresholds:
+            preds_thr = (val_probs_all >= thr).astype(int)
+            acc_thr   = (preds_thr == val_labels_all).mean() * 100.0
+            if acc_thr > best_thr_acc_val:
+                best_thr_acc_val = acc_thr
+                best_thr = thr
+
+        # -- NOW: Evaluate on test with that threshold
         test_probs = []
         test_labels = []
         with torch.no_grad():
             for (bpm_in, steps_in, pids, labels) in test_loader:
                 bpm_in   = bpm_in.to(device)
                 steps_in = steps_in.to(device)
-                labels   = labels.cpu().numpy()  # shape [B]
+                labels   = labels.cpu().numpy()
                 logits   = classifier(bpm_in, steps_in)
-                probs    = torch.sigmoid(logits).cpu().numpy()  # shape [B]
+                probs    = torch.sigmoid(logits).cpu().numpy()
 
                 test_probs.extend(probs)
                 test_labels.extend(labels)
 
-        test_probs  = np.array(test_probs)   # shape [N]
-        test_labels = np.array(test_labels)  # shape [N]
+        test_probs  = np.array(test_probs)
+        test_labels = np.array(test_labels)
 
-        # (A) Compute AUC
-        # If all labels are 0 or all are 1, roc_auc_score can't be computed => handle that case
+        # Compute AUC
         if len(np.unique(test_labels)) == 1:
             auc_val = float('nan')
         else:
             auc_val = roc_auc_score(test_labels, test_probs)
 
-        # (B) Evaluate at threshold=0.5
-        test_preds_05 = (test_probs >= 0.5).astype(int)
-        test_acc_05   = (test_preds_05 == test_labels).mean() * 100.0
-        cm_05         = confusion_matrix(test_labels, test_preds_05, labels=[0,1])
+        # Evaluate at chosen threshold
+        test_preds = (test_probs >= best_thr).astype(int)
+        test_acc   = (test_preds == test_labels).mean() * 100.0
+        cm         = confusion_matrix(test_labels, test_preds, labels=[0,1])
 
-        # (C) Find best threshold for accuracy
-        thresholds = np.linspace(0.0, 1.0, 101)  # e.g. 0.00, 0.01, ..., 1.00
-        best_thr_acc = 0.0
-        best_thr = 0.5
-        for thr in thresholds:
-            preds_thr = (test_probs >= thr).astype(int)
-            acc_thr   = (preds_thr == test_labels).mean() * 100.0
-            if acc_thr > best_thr_acc:
-                best_thr_acc = acc_thr
-                best_thr     = thr
-
-        best_preds = (test_probs >= best_thr).astype(int)
-        cm_best    = confusion_matrix(test_labels, best_preds, labels=[0,1])
-
-        # Print results
-        print(f"\n[User {user_id}] => TEST RESULTS:")
+        tn, fp, fn, tp = cm.ravel()
+        print(f"\n[User {user_id}] => TEST with threshold from VAL={best_thr:.3f}")
         print(f" - AUC = {auc_val:.4f} (NaN if all labels are the same)")
-        print(f" - Accuracy at threshold=0.5 => {test_acc_05:.2f}%")
-        print(f" - Best threshold for accuracy => {best_thr:.3f}, Accuracy={best_thr_acc:.2f}%")
-        print("Confusion Matrix at threshold=0.5:")
-        print(cm_05)
-        print("Confusion Matrix at best threshold:")
-        print(cm_best)
+        print(f" - Accuracy at threshold={best_thr:.3f} => {test_acc:.2f}%")
+        print("Confusion Matrix [0,1]:")
+        print(cm)
 
-        # Plot confusion matrix for threshold=0.5
+        # Plot confusion matrix
         plt.figure(figsize=(5,4))
-        plt.imshow(cm_05, cmap='Blues')
-        plt.title(f"User {user_id} CM (th=0.5) Acc={test_acc_05:.2f}%")
+        plt.imshow(cm, cmap='Blues')
+        plt.title(f"User {user_id} CM (th={best_thr:.2f}) Acc={test_acc:.2f}%")
         plt.colorbar()
-        for i in range(cm_05.shape[0]):
-            for j in range(cm_05.shape[1]):
-                plt.text(j, i, cm_05[i, j],
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                plt.text(j, i, cm[i, j],
                          ha="center", va="center",
-                         color="white" if cm_05[i, j] > (cm_05.max()/2) else "black")
+                         color="white" if cm[i, j] > (cm.max()/2) else "black")
         plt.xlabel("Predicted")
         plt.ylabel("True")
         plt.tight_layout()
-        cm05_path = os.path.join(user_test_dir, "cm_threshold_0.5.png")
-        plt.savefig(cm05_path)
+        cm_path = os.path.join(user_test_dir, f"cm_threshold_{best_thr:.2f}.png")
+        plt.savefig(cm_path)
         plt.close()
 
-        # Plot confusion matrix for best threshold
-        plt.figure(figsize=(5,4))
-        plt.imshow(cm_best, cmap='Blues')
-        plt.title(f"User {user_id} CM (th={best_thr:.2f}) Acc={best_thr_acc:.2f}%")
-        plt.colorbar()
-        for i in range(cm_best.shape[0]):
-            for j in range(cm_best.shape[1]):
-                plt.text(j, i, cm_best[i, j],
-                         ha="center", va="center",
-                         color="white" if cm_best[i, j] > (cm_best.max()/2) else "black")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.tight_layout()
-        cm_best_path = os.path.join(user_test_dir, "cm_best_threshold.png")
-        plt.savefig(cm_best_path)
-        plt.close()
-
-        # store global result (for threshold=0.5)
-        tn_05, fp_05, fn_05, tp_05 = cm_05.ravel()
         global_results.append({
             'user_id': user_id,
+            'val_threshold': best_thr,
             'auc': auc_val,
-            'acc_0.5': test_acc_05,
-            'tn_0.5': tn_05,
-            'fp_0.5': fp_05,
-            'fn_0.5': fn_05,
-            'tp_0.5': tp_05,
-            'best_thr': best_thr,
-            'best_acc': best_thr_acc
+            'accuracy': test_acc,
+            'tn': tn,
+            'fp': fp,
+            'fn': fn,
+            'tp': tp
         })
 
     # Summaries across all users
@@ -516,7 +543,7 @@ def main():
         results_df.to_csv(results_csv, index=False)
         print(f"\nSaved test summary => {results_csv}")
 
-        # Sort by AUC (ignoring NaN)
+        # Some quick prints
         results_df_no_nan = results_df.dropna(subset=['auc'])
         best_auc_df  = results_df_no_nan.sort_values('auc', ascending=False).head(5)
         worst_auc_df = results_df_no_nan.sort_values('auc', ascending=True).head(5)
@@ -524,13 +551,13 @@ def main():
         print("\nTop 5 Users by AUC:\n", best_auc_df)
         print("\nWorst 5 Users by AUC:\n", worst_auc_df)
 
-        # Similarly, top 5 by best_thr_acc
-        best_acc_df  = results_df.sort_values('best_acc', ascending=False).head(5)
-        print("\nTop 5 Users by Best-Threshold Accuracy:\n", best_acc_df)
+        best_acc_df  = results_df.sort_values('accuracy', ascending=False).head(5)
+        print("\nTop 5 Users by Accuracy:\n", best_acc_df)
     else:
         print("No classification results to summarize.")
 
     print("\nDone with final drug classification on test sets!\n")
+
 
 if __name__ == "__main__":
     main()
