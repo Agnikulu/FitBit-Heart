@@ -1,8 +1,7 @@
-# test.py
-
 import os
 import glob
 import warnings
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -11,29 +10,52 @@ import matplotlib.pyplot as plt
 
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import RandomSampler
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_auc_score
 
-# Make sure you have these modules in your project:
-# models.py => DrugClassifier
-# utils.py  => scale_per_user, user_scalers, WINDOW_SIZE
-from models import DrugClassifier
-from utils import scale_per_user, user_scalers, WINDOW_SIZE
+###############################################################################
+# Adjust these placeholders with your actual code/paths/models as needed
+###############################################################################
+WINDOW_SIZE = 6  # e.g. 6-hour window
+def scale_per_user(df):
+    """Simple Z-score scaling per user on bpm/steps."""
+    df = df.sort_values('datetime').copy()
+    df['bpm_scaled'] = (df['bpm'] - df['bpm'].mean()) / (df['bpm'].std() + 1e-9)
+    df['steps_scaled'] = (df['steps'] - df['steps'].mean()) / (df['steps'].std() + 1e-9)
+    return df
 
-warnings.filterwarnings('ignore')
+class DrugClassifier(nn.Module):
+    """
+    Replace this with your actual CNN+LSTM or other arch.
+    For demonstration, a simple MLP on the concatenation of
+    [bpm_in, steps_in] -> dimension = 2 * window_size.
+    """
+    def __init__(self, window_size=6):
+        super().__init__()
+        self.window_size = window_size
+        self.features = nn.Sequential(
+            nn.Linear(2 * window_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+        self.classifier = nn.Linear(32, 1)
 
-##############################################
-# 1) LOADING & PREPROCESSING HOURLY DATA + LABELS
-##############################################
-"""
-We assume:
- - You have your minute-level sensor data in /Biosignal
- - You have label files in /Label that indicate usage events
- - We merge them into an hourly 'df_merged' => columns [id, datetime, bpm, steps, label]
- - We do a final grouping by user + scaling => columns [bpm_scaled, steps_scaled, label]
-"""
+    def forward(self, bpm_in, steps_in):
+        # shape (batch_size, window_size)
+        x = torch.cat([bpm_in, steps_in], dim=1)  # shape = (batch_size, 2*window_size)
+        feats = self.features(x)
+        logits = self.classifier(feats).squeeze(-1)
+        return logits
 
-def load_and_merge_data():
-    # 1A) Load sensor data, pivot to hourly BPM/Steps
+###############################################################################
+# 1) LOAD SENSOR DATA => HOURLY
+###############################################################################
+def load_sensor_data():
+    """
+    Reads minute-level sensor data from data/Personalized AI Data/Biosignal/*.csv
+    Aggregates to hourly resolution => [id, datetime, date, hour, bpm, steps].
+    """
     data_folder = "data/Personalized AI Data/Biosignal"
     csv_files = glob.glob(os.path.join(data_folder, "*.csv"))
     if not csv_files:
@@ -42,7 +64,7 @@ def load_and_merge_data():
     df_list = []
     for file in csv_files:
         tmp = pd.read_csv(file, parse_dates=['time'])
-        # If participant_id missing, parse from filename
+        # If 'participant_id' missing, parse from filename
         if 'participant_id' not in tmp.columns:
             base = os.path.basename(file)
             name_no_ext = os.path.splitext(base)[0]
@@ -56,11 +78,11 @@ def load_and_merge_data():
     df_raw = pd.concat(df_list, ignore_index=True)
     df_raw.loc[df_raw['data_type'] == 'hr','data_type'] = 'heart_rate'
 
-    # Filter for heart_rate & steps only
+    # filter for heart_rate & steps
     df_filt = df_raw[df_raw['data_type'].isin(['heart_rate','steps'])].copy()
-    df_filt = df_filt.drop_duplicates(subset=['participant_id','time','data_type'])
+    df_filt.drop_duplicates(subset=['participant_id','time','data_type'], inplace=True)
 
-    # Pivot => [id, time, bpm, steps]
+    # pivot => [id, time, bpm, steps]
     df_pivot = df_filt.pivot(
         index=['participant_id','time'],
         columns='data_type',
@@ -72,37 +94,50 @@ def load_and_merge_data():
     df_pivot['steps'] = pd.to_numeric(df_pivot['steps'], errors='coerce')
     df_pivot.dropna(subset=['bpm','steps'], inplace=True)
 
-    # Add date/hour
     df_pivot['datetime'] = pd.to_datetime(df_pivot['time'])
     df_pivot['date'] = df_pivot['datetime'].dt.date
     df_pivot['hour'] = df_pivot['datetime'].dt.hour
 
     df_sensors = df_pivot[['id','datetime','date','hour','bpm','steps']].copy()
-    df_sensors = df_sensors.sort_values(by=['id','datetime']).reset_index(drop=True)
+    df_sensors.sort_values(by=['id','datetime'], inplace=True)
+    df_sensors.reset_index(drop=True, inplace=True)
 
-    # Hourly aggregation
-    def to_hour_datetime(dateval, hourval):
-        return pd.to_datetime(dateval) + pd.to_timedelta(hourval, unit='H')
-
+    # group to hourly
     df_sensors['date'] = pd.to_datetime(df_sensors['date'])
+    def to_hour_datetime(d, h):
+        return pd.to_datetime(d) + pd.to_timedelta(h, unit='H')
     df_hourly = df_sensors.groupby(['id','date','hour'], as_index=False).agg({
         'bpm':'mean',
         'steps':'sum'
     })
-    df_hourly['datetime'] = df_hourly.apply(
-        lambda row: to_hour_datetime(row['date'], row['hour']), axis=1
-    )
-    df_hourly = df_hourly[['id','datetime','date','hour','bpm','steps']]
-    df_hourly = df_hourly.sort_values(by=['id','datetime']).reset_index(drop=True)
+    df_hourly['datetime'] = df_hourly.apply(lambda r: to_hour_datetime(r['date'], r['hour']), axis=1)
+    df_hourly.sort_values(['id','datetime'], inplace=True)
+    df_hourly.reset_index(drop=True, inplace=True)
 
-    # 1B) Load usage label files from /Label
+    return df_hourly
+
+###############################################################################
+# 2) LOAD LABEL DATA (Fruits => "substances"), pivot to hour-level
+###############################################################################
+def load_label_data():
+    """
+    Reads label data from data/Personalized AI Data/Label/ID*/...
+    We expect columns: 
+      - 'substance_fruit_label' => e.g. "Carrot", "Coconut", etc.
+      - 'crave_use_none_label' => "Use", "Crave", or "None"
+      - time col among 'hawaii_use_time', 'hawaii_createdat_time', 'created_at'
+    We only keep rows with "Use" or "Crave".
+    """
     labels_dir = "data/Personalized AI Data/Label"
-    all_label_rows = []
+    all_rows = []
 
     subdirs = glob.glob(os.path.join(labels_dir, "ID*"))
     for sd in subdirs:
-        pid_str = os.path.basename(sd)
-        p_id = int(pid_str.replace("ID", ""))  # e.g. "ID14" => 14
+        pid_str = os.path.basename(sd)  # e.g. "ID5"
+        try:
+            p_id = int(pid_str.replace("ID",""))
+        except:
+            continue
 
         label_files = glob.glob(os.path.join(sd, "*.csv")) + glob.glob(os.path.join(sd, "*.xlsx"))
         for lf in label_files:
@@ -112,7 +147,8 @@ def load_and_merge_data():
                     df_label = pd.read_csv(lf)
                 except:
                     continue
-            elif lf.endswith(".xlsx"):
+            else:
+                # xlsx
                 try:
                     df_label = pd.read_excel(lf)
                 except:
@@ -121,65 +157,107 @@ def load_and_merge_data():
             if df_label is None or df_label.empty:
                 continue
 
-            # Check known time col
+            # pick time col
             time_col = None
-            if 'hawaii_use_time' in df_label.columns:
-                time_col = 'hawaii_use_time'
-            elif 'hawaii_createdat_time' in df_label.columns:
-                time_col = 'hawaii_createdat_time'
-            else:
+            for c in ["hawaii_use_time","hawaii_createdat_time","created_at"]:
+                if c in df_label.columns:
+                    time_col = c
+                    break
+            if not time_col:
                 continue
 
             df_label[time_col] = pd.to_datetime(df_label[time_col], errors='coerce')
             df_label.dropna(subset=[time_col], inplace=True)
 
-            for idx, row in df_label.iterrows():
+            for _, row in df_label.iterrows():
+                fruit_str = str(row.get('substance_fruit_label','')).lower().strip()
                 label_str = str(row.get('crave_use_none_label','')).lower().strip()
-                event_dt  = row[time_col]
-                if label_str in ['use','crave']:
-                    label_val = 1
-                else:
-                    label_val = 0
+                dtime = row[time_col]
 
-                all_label_rows.append({
+                if label_str not in ["use","crave"]:
+                    # skip "None" or anything else
+                    continue
+
+                all_rows.append({
                     'id': p_id,
-                    'datetime': event_dt,
-                    'label': label_val
+                    'datetime': dtime,
+                    'fruit_substance': fruit_str,  # e.g. "carrot", "coconut", "almond"...
+                    'label_str': label_str        # "use" or "crave"
                 })
 
-    df_labels = pd.DataFrame(all_label_rows)
-    df_labels.dropna(subset=['datetime'], inplace=True)
-    df_labels = df_labels.sort_values(['id','datetime']).reset_index(drop=True)
+    df_labels = pd.DataFrame(all_rows)
+    df_labels.sort_values(['id','datetime'], inplace=True)
+    df_labels.reset_index(drop=True, inplace=True)
+    return df_labels
 
+def pivot_label_data(df_labels):
+    """
+    For each unique fruit_substance => create columns <fruit>_use_label, <fruit>_crave_label
+    Then group by hour => take 'max' within each hour to get a 1/0 label.
+    """
+    if df_labels.empty:
+        return df_labels
+
+    all_fruits = sorted(df_labels['fruit_substance'].unique())
+    label_types = ["use","crave"]
+
+    # create columns
+    for f in all_fruits:
+        for lbl in label_types:
+            colname = f"{f}_{lbl}_label"
+            df_labels[colname] = 0
+
+    # set 1 if row matches that fruit + label_str
+    for idx, row in df_labels.iterrows():
+        f = row['fruit_substance']
+        l = row['label_str']
+        col = f"{f}_{l}_label"
+        if col in df_labels.columns:
+            df_labels.at[idx, col] = 1
+
+    # group by hour
     df_labels['date'] = df_labels['datetime'].dt.date
     df_labels['hour'] = df_labels['datetime'].dt.hour
     df_labels['date'] = pd.to_datetime(df_labels['date'])
-    df_labels_hour = df_labels.groupby(['id','date','hour'], as_index=False)['label'].max()
-    df_labels_hour['datetime'] = df_labels_hour.apply(
-        lambda row: to_hour_datetime(row['date'], row['hour']), axis=1
-    )
-    df_labels_hour = df_labels_hour[['id','datetime','label']].sort_values(['id','datetime'])
-    df_labels_hour.reset_index(drop=True, inplace=True)
 
-    # Merge sensors with labels
-    df_sensors_hour = df_hourly.copy()
+    agg_dict = {}
+    for f in all_fruits:
+        for lbl in label_types:
+            c = f"{f}_{lbl}_label"
+            agg_dict[c] = 'max'
+
+    df_hour_labels = df_labels.groupby(['id','date','hour'], as_index=False).agg(agg_dict)
+
+    def to_hour_datetime(d, h):
+        return pd.to_datetime(d) + pd.to_timedelta(h, unit='H')
+    df_hour_labels['datetime'] = df_hour_labels.apply(lambda r: to_hour_datetime(r['date'], r['hour']), axis=1)
+
+    return df_hour_labels
+
+def merge_sensors_with_labels(df_sensors_hour, df_hour_labels):
+    """
+    Merge sensor data with wide label columns. Fill missing labels => 0.
+    """
+    if df_hour_labels.empty:
+        return df_sensors_hour.copy()
+
+    # ensure tz naive
     df_sensors_hour['datetime'] = df_sensors_hour['datetime'].dt.tz_localize(None)
-    df_labels_hour['datetime'] = df_labels_hour['datetime'].dt.tz_localize(None)
+    df_hour_labels['datetime'] = df_hour_labels['datetime'].dt.tz_localize(None)
 
-    df_merged = pd.merge(df_sensors_hour, df_labels_hour, on=['id','datetime'], how='left')
-    df_merged['label'] = df_merged['label'].fillna(0).astype(int)
+    df_merged = pd.merge(df_sensors_hour, df_hour_labels, on=['id','datetime'], how='left')
+    label_cols = [c for c in df_hour_labels.columns if c.endswith('_label')]
+    for c in label_cols:
+        if c not in df_merged.columns:
+            df_merged[c] = 0
+    df_merged[label_cols] = df_merged[label_cols].fillna(0).astype(int)
     return df_merged
 
-
-##############################################
-# 2) CREATE Classification Dataset (Windowed)
-##############################################
+###############################################################################
+# 3) CREATE NON-OVERLAPPING WINDOWED DATA
+###############################################################################
 class CravingDataset(Dataset):
-    """
-    Each item => (bpm_input, steps_input, user_id, label).
-    We'll define chunk windows of length=WINDOW_SIZE for features,
-    label=1 if ANY row in that chunk => label=1.
-    """
+    """Each sample => (bpm_input, steps_input, user_id, label)."""
     def __init__(self, data_list):
         self.data_list = data_list
 
@@ -190,374 +268,341 @@ class CravingDataset(Dataset):
         d = self.data_list[idx]
         bpm_in   = torch.tensor(d['bpm_input'], dtype=torch.float32)     # shape [WINDOW_SIZE]
         steps_in = torch.tensor(d['steps_input'], dtype=torch.float32)   # shape [WINDOW_SIZE]
-        label    = torch.tensor(d['label'],       dtype=torch.float32)
+        label    = torch.tensor(d['label'], dtype=torch.float32)
         uid      = d['id']
         return bpm_in, steps_in, uid, label
 
-
-def create_classification_samples(df_merged, window_size=6):
+def create_classification_samples(df_user, label_col, window_size=6):
     """
-    For each (id):
-     1) sort by datetime,
-     2) break into non-overlapping windows of size=window_size,
-     3) label=1 if ANY row in that chunk => label=1,
-     4) store [bpm_scaled, steps_scaled].
+    Slice user data in non-overlapping windows of size=window_size.
+    label=1 if ANY row in chunk => label_col=1, else 0.
+    Use scaled columns if present, else raw.
     """
-    data_samples = []
-    for uid, group in df_merged.groupby('id'):
-        group = group.sort_values('datetime').reset_index(drop=True)
+    samples = []
+    df_user = df_user.sort_values('datetime').reset_index(drop=True)
+    n = len(df_user)
+    for i in range(0, n, window_size):
+        chunk = df_user.iloc[i : i+window_size]
+        if len(chunk) < window_size:
+            break
+        chunk_label = 1 if (chunk[label_col].max() == 1) else 0
 
-        # Break into non-overlapping windows
-        for i in range(0, len(group), window_size):
-            chunk = group.iloc[i : i + window_size]
-            if len(chunk) == window_size:
-                chunk_label = 1 if (chunk['label'].max() == 1) else 0
-                # We prefer scaled columns if present
-                if 'bpm_scaled' in chunk.columns:
-                    bpm_arr   = chunk['bpm_scaled'].values
-                    steps_arr = chunk['steps_scaled'].values
-                else:
-                    bpm_arr   = chunk['bpm'].values
-                    steps_arr = chunk['steps'].values
-
-                data_samples.append({
-                    'id': uid,
-                    'bpm_input': bpm_arr,
-                    'steps_input': steps_arr,
-                    'label': chunk_label,
-                    'datetime_start': chunk['datetime'].iloc[0],
-                    'datetime_end':   chunk['datetime'].iloc[-1]
-                })
-    return data_samples
-
-
-##############################################
-# HELPER: BALANCE DATASET (Downsample)
-##############################################
-import random
-
-def balance_train_data(train_list, mode='downsample'):
-    """
-    Balances the training set to have equal positives and negatives by downsampling the majority.
-    Returns balanced_train, extras (the 'extra' majority samples that got removed).
-    """
-    pos_list = [d for d in train_list if d['label'] == 1]
-    neg_list = [d for d in train_list if d['label'] == 0]
-
-    n_pos = len(pos_list)
-    n_neg = len(neg_list)
-    if n_pos == 0 or n_neg == 0:
-        # no balancing possible
-        return train_list, []
-
-    # pick the smaller group size
-    target_size = min(n_pos, n_neg)
-    extras = []
-
-    if mode == 'downsample':
-        if n_pos < n_neg:
-            random.shuffle(neg_list)
-            neg_down = neg_list[:target_size]
-            extras = neg_list[target_size:]
-            balanced_data = pos_list + neg_down
+        if 'bpm_scaled' in chunk.columns and 'steps_scaled' in chunk.columns:
+            bpm_arr   = chunk['bpm_scaled'].values
+            steps_arr = chunk['steps_scaled'].values
         else:
-            random.shuffle(pos_list)
-            pos_down = pos_list[:target_size]
-            extras = pos_list[target_size:]
-            balanced_data = pos_down + neg_list
+            bpm_arr   = chunk['bpm'].values
+            steps_arr = chunk['steps'].values
 
-    # Shuffle final
-    random.shuffle(balanced_data)
-    return balanced_data, extras
+        samples.append({
+            'id': chunk['id'].iloc[0],
+            'bpm_input': bpm_arr,
+            'steps_input': steps_arr,
+            'label': chunk_label,
+            'datetime_start': chunk['datetime'].iloc[0],
+            'datetime_end':   chunk['datetime'].iloc[-1]
+        })
+    return samples
 
-
-##############################################
-# 3) MAIN SCRIPT
-##############################################
+###############################################################################
+# 4) MAIN
+###############################################################################
 def main():
-    # 1) load + merge
-    df_merged = load_and_merge_data()
-    print("Merged shape:", df_merged.shape)
-    print("Columns:", df_merged.columns.tolist())
+    warnings.filterwarnings('ignore')
 
-    # 2) scale => 'bpm_scaled','steps_scaled'
+    # 1) sensor data => hourly
+    df_sensors_hour = load_sensor_data()
+    print("Sensor data shape:", df_sensors_hour.shape)
+
+    # 2) label data => pivot
+    df_labels_raw = load_label_data()
+    df_hour_labels = pivot_label_data(df_labels_raw)
+    print("Label data shape (hourly):", df_hour_labels.shape)
+
+    # 3) merge => df_merged
+    df_merged = merge_sensors_with_labels(df_sensors_hour, df_hour_labels)
+
+    # scale
     df_merged = df_merged.groupby('id').apply(scale_per_user).reset_index(drop=True)
 
-    # 3) create classification samples
-    data_samples = create_classification_samples(df_merged, window_size=WINDOW_SIZE)
-    print("Created classification samples:", len(data_samples))
-
-    # We'll store final test results for each user
-    global_results = []
+    # find label cols
+    label_cols = [c for c in df_merged.columns if c.endswith('_label')]
+    if not label_cols:
+        print("No label columns found => no classification tasks.")
+        return
+    label_cols = sorted(label_cols)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     unique_ids = sorted(df_merged['id'].unique())
 
+    global_results = []
+
     for user_id in unique_ids:
-        # Create a user-specific directory for test results
-        user_test_dir = os.path.join("results", "test", f"user_{user_id}")
-        os.makedirs(user_test_dir, exist_ok=True)
+        user_dir = os.path.join("results", "test", f"user_{user_id}")
+        os.makedirs(user_dir, exist_ok=True)
 
-        user_data = [s for s in data_samples if s['id'] == user_id]
-        if len(user_data) < 15:
-            print(f"[User {user_id}] Skipping => not enough classification samples (<15).")
+        df_user = df_merged[df_merged['id']==user_id].copy()
+        if len(df_user) < 2*WINDOW_SIZE:
+            print(f"[User {user_id}] => not enough rows for windows.")
             continue
 
-        # 4) train/val/test split => e.g. 70/15/15
-        total_count = len(user_data)
-        train_cut = int(0.70 * total_count)
-        val_cut   = int(0.85 * total_count)
-        user_train = user_data[:train_cut]
-        user_val   = user_data[train_cut:val_cut]
-        user_test  = user_data[val_cut:]
+        for label_col in label_cols:
+            # create windowed samples
+            data_samples = create_classification_samples(df_user, label_col, WINDOW_SIZE)
+            if len(data_samples) < 15:
+                print(f"[User {user_id} | {label_col}] => not enough classification windows (<15).")
+                continue
 
-        if len(user_val) < 1 or len(user_test) < 1:
-            print(f"[User {user_id}] Skipping => not enough val/test data.")
-            continue
+            labels_all = [s['label'] for s in data_samples]
+            pos_count = sum(labels_all)
+            neg_count = len(data_samples) - pos_count
 
-        # 4B) Downsample training data, then add extras to test
-        balanced_train, extras = balance_train_data(user_train, mode='downsample')
-        user_test += extras
-        random.shuffle(user_test)
+            # Fix for “least populated class in y has only 1 member”
+            # => skip if <2 positives OR <2 negatives
+            if pos_count < 2:
+                print(f"[User {user_id} | {label_col}] => skipping => not enough positive samples (pos_count={pos_count}).")
+                continue
+            if neg_count < 2:
+                print(f"[User {user_id} | {label_col}] => skipping => not enough negative samples (neg_count={neg_count}).")
+                continue
 
-        # Build dataset
-        train_ds = CravingDataset(balanced_train)
-        val_ds   = CravingDataset(user_val)
-        test_ds  = CravingDataset(user_test)
+            # Now we can do stratified splits safely.
+            X_idx = np.arange(len(data_samples))
+            y_lbl = np.array(labels_all)
 
-        train_loader = DataLoader(train_ds, batch_size=32, sampler=RandomSampler(train_ds))
-        val_loader   = DataLoader(val_ds, batch_size=32, sampler=RandomSampler(val_ds))
-        test_loader  = DataLoader(test_ds, batch_size=32)
+            # first => 15% test
+            trainval_idx, test_idx = train_test_split(
+                X_idx,
+                test_size=0.15,
+                shuffle=True,
+                stratify=y_lbl,
+                random_state=42
+            )
+            if len(trainval_idx)==0 or len(test_idx)==0:
+                print(f"[User {user_id} | {label_col}] => skipping => no data after test split.")
+                continue
 
-        # 5) Build classifier => load user forecasting checkpoint from saved models
-        user_model_dir = os.path.join("results", "train", f"user_{user_id}")
-        user_ckpt = os.path.join(user_model_dir, "personalized_ssl.pt")
-        if not os.path.exists(user_ckpt):
-            print(f"[User {user_id}] No saved model checkpoint at {user_ckpt} => skip classification.")
-            continue
+            # second => val from trainval
+            val_size = 0.15 / 0.85  # ~17.6% of total
+            train_idx, val_idx = train_test_split(
+                trainval_idx,
+                test_size=val_size,
+                shuffle=True,
+                stratify=y_lbl[trainval_idx],
+                random_state=42
+            )
 
-        classifier = DrugClassifier(window_size=WINDOW_SIZE).to(device)
+            user_train = [data_samples[i] for i in train_idx]
+            user_val   = [data_samples[i] for i in val_idx]
+            user_test  = [data_samples[i] for i in test_idx]
 
-        # Load forecasting weights into classifier's CNN+LSTM
-        pers_sd = torch.load(user_ckpt, map_location=device)
-        classifier.load_state_dict(pers_sd, strict=False)
+            if len(user_train)==0 or len(user_val)==0 or len(user_test)==0:
+                print(f"[User {user_id} | {label_col}] => skipping => not enough train/val/test data.")
+                continue
 
-        # Freeze the CNN+LSTM, only train classifier head
-        for name, param in classifier.named_parameters():
-            if 'classifier' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+            # build dataset/dataloaders
+            train_ds = CravingDataset(user_train)
+            val_ds   = CravingDataset(user_val)
+            test_ds  = CravingDataset(user_test)
 
-        # Because we manually balanced the training data, we can use standard BCE
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(classifier.classifier.parameters(), lr=1e-3)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-        num_epochs = 20
-        patience = 5
+            train_loader = DataLoader(train_ds, batch_size=32, sampler=RandomSampler(train_ds))
+            val_loader   = DataLoader(val_ds, batch_size=32, sampler=RandomSampler(val_ds))
+            test_loader  = DataLoader(test_ds, batch_size=32)
 
-        best_val_loss = float('inf')
-        epochs_no_improve = 0
-        best_path = os.path.join(user_test_dir, "drug_classifier.pth")
+            # build classifier
+            classifier = DrugClassifier(window_size=WINDOW_SIZE).to(device)
+            # (Optionally load pretrained checkpoint for user)
 
-        # We'll store train/val stats
-        STATS = {
-            'epoch': [],
-            'train_loss': [],
-            'val_loss': [],
-            'val_acc': []
-        }
+            criterion = nn.BCEWithLogitsLoss()
+            optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+            num_epochs = 20
+            patience = 5
 
-        # 6) Classification training loop
-        for epoch in range(num_epochs):
-            if epochs_no_improve >= patience:
-                print(f"[User {user_id}] Early stop at epoch={epoch+1}")
-                break
+            best_val_loss = float('inf')
+            epochs_no_improve = 0
 
-            # -- TRAIN --
-            classifier.train()
-            sum_train_loss = 0.0
-            for (bpm_in, steps_in, pids, labels) in train_loader:
-                bpm_in   = bpm_in.to(device)
-                steps_in = steps_in.to(device)
-                labels   = labels.to(device)
+            label_subdir = os.path.join(user_dir, label_col)
+            os.makedirs(label_subdir, exist_ok=True)
+            best_model_path = os.path.join(label_subdir, "best_model.pth")
 
-                optimizer.zero_grad()
-                logits = classifier(bpm_in, steps_in)
-                loss   = criterion(logits, labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
-                optimizer.step()
-                sum_train_loss += loss.item()
+            STATS = {
+                'epoch': [],
+                'train_loss': [],
+                'val_loss': [],
+                'val_acc_05': []
+            }
 
-            scheduler.step()
-            avg_train_loss = sum_train_loss / len(train_loader)
+            # train loop
+            for epoch in range(num_epochs):
+                if epochs_no_improve >= patience:
+                    print(f"[User {user_id} | {label_col}] => Early stop at epoch {epoch+1}")
+                    break
 
-            # -- VAL --
-            classifier.eval()
-            sum_val_loss = 0.0
-            val_preds_05 = []
-            val_true  = []
-            with torch.no_grad():
-                for (bpm_in, steps_in, pids, labels) in val_loader:
+                # --- train ---
+                classifier.train()
+                sum_train_loss = 0.0
+                for (bpm_in, steps_in, pids, labels) in train_loader:
                     bpm_in   = bpm_in.to(device)
                     steps_in = steps_in.to(device)
                     labels   = labels.to(device)
 
+                    optimizer.zero_grad()
                     logits = classifier(bpm_in, steps_in)
                     loss = criterion(logits, labels)
-                    sum_val_loss += loss.item()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+                    optimizer.step()
+                    sum_train_loss += loss.item()
 
-                    probs = torch.sigmoid(logits).cpu().numpy()
-                    preds_05 = (probs >= 0.5).astype(int)
+                scheduler.step()
+                avg_train_loss = sum_train_loss / len(train_loader)
 
-                    val_preds_05.extend(preds_05)
-                    val_true.extend(labels.cpu().numpy())
+                # --- val ---
+                classifier.eval()
+                sum_val_loss = 0.0
+                val_preds_05 = []
+                val_true = []
+                with torch.no_grad():
+                    for (bpm_in, steps_in, pids, labels) in val_loader:
+                        bpm_in   = bpm_in.to(device)
+                        steps_in = steps_in.to(device)
+                        labels   = labels.to(device)
 
-            avg_val_loss = sum_val_loss / len(val_loader)
-            val_preds_05 = np.array(val_preds_05)
-            val_true     = np.array(val_true)
-            val_acc_05   = (val_preds_05 == val_true).mean() * 100.0
+                        logits = classifier(bpm_in, steps_in)
+                        loss = criterion(logits, labels)
+                        sum_val_loss += loss.item()
 
-            # Early stopping
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                epochs_no_improve = 0
-                torch.save(classifier.state_dict(), best_path)
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        preds_05 = (probs >= 0.5).astype(int)
+                        val_preds_05.extend(preds_05)
+                        val_true.extend(labels.cpu().numpy())
+
+                avg_val_loss = sum_val_loss / len(val_loader)
+                val_preds_05 = np.array(val_preds_05)
+                val_true     = np.array(val_true)
+                val_acc_05   = (val_preds_05 == val_true).mean() * 100.0
+
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    epochs_no_improve = 0
+                    torch.save(classifier.state_dict(), best_model_path)
+                else:
+                    epochs_no_improve += 1
+
+                STATS['epoch'].append(epoch+1)
+                STATS['train_loss'].append(avg_train_loss)
+                STATS['val_loss'].append(avg_val_loss)
+                STATS['val_acc_05'].append(val_acc_05)
+
+                print(f"[User {user_id} | {label_col}] epoch={epoch+1}/{num_epochs}, "
+                      f"trainLoss={avg_train_loss:.4f}, valLoss={avg_val_loss:.4f}, "
+                      f"valAcc@0.5={val_acc_05:.2f}%")
+
+            # save stats
+            stats_df = pd.DataFrame(STATS)
+            stats_df.to_csv(os.path.join(label_subdir, "train_val_stats.csv"), index=False)
+
+            # 5) Evaluate test w/ best threshold from val
+            classifier.load_state_dict(torch.load(best_model_path, map_location=device))
+            classifier.eval()
+
+            # find best threshold from val
+            val_probs = []
+            val_lbls  = []
+            with torch.no_grad():
+                for (bpm_in, steps_in, pids, labels) in val_loader:
+                    bpm_in   = bpm_in.to(device)
+                    steps_in = steps_in.to(device)
+                    l_cpu    = labels.cpu().numpy()
+                    logits   = classifier(bpm_in, steps_in)
+                    probs    = torch.sigmoid(logits).cpu().numpy()
+
+                    val_probs.extend(probs)
+                    val_lbls.extend(l_cpu)
+
+            val_probs = np.array(val_probs)
+            val_lbls  = np.array(val_lbls)
+            thresholds = np.linspace(0.0, 1.0, 101)
+            best_thr = 0.5
+            best_acc_val = 0.0
+            for thr in thresholds:
+                preds_thr = (val_probs >= thr).astype(int)
+                acc_thr   = (preds_thr == val_lbls).mean() * 100.0
+                if acc_thr > best_acc_val:
+                    best_acc_val = acc_thr
+                    best_thr = thr
+
+            # test
+            test_probs = []
+            test_lbls  = []
+            with torch.no_grad():
+                for (bpm_in, steps_in, pids, labels) in test_loader:
+                    bpm_in   = bpm_in.to(device)
+                    steps_in = steps_in.to(device)
+                    l_cpu    = labels.cpu().numpy()
+                    logits   = classifier(bpm_in, steps_in)
+                    probs    = torch.sigmoid(logits).cpu().numpy()
+
+                    test_probs.extend(probs)
+                    test_lbls.extend(l_cpu)
+
+            test_probs = np.array(test_probs)
+            test_lbls  = np.array(test_lbls)
+
+            if len(np.unique(test_lbls)) == 1:
+                auc_val = float('nan')
             else:
-                epochs_no_improve += 1
+                auc_val = roc_auc_score(test_lbls, test_probs)
 
-            STATS['epoch'].append(epoch+1)
-            STATS['train_loss'].append(avg_train_loss)
-            STATS['val_loss'].append(avg_val_loss)
-            STATS['val_acc'].append(val_acc_05)
+            test_preds = (test_probs >= best_thr).astype(int)
+            test_acc   = (test_preds == test_lbls).mean() * 100.0
+            cm         = confusion_matrix(test_lbls, test_preds, labels=[0,1])
+            tn, fp, fn, tp = cm.ravel()
 
-            print(f"[User {user_id}] Epoch={epoch+1}/{num_epochs}, "
-                  f"TrainLoss={avg_train_loss:.4f}, "
-                  f"ValLoss={avg_val_loss:.4f}, "
-                  f"ValAcc(0.5)={val_acc_05:.2f}%")
+            print(f"\n[User {user_id} | {label_col}] => TEST thr={best_thr:.2f}")
+            print(f" - AUC={auc_val:.4f}, Accuracy={test_acc:.2f}%")
+            print("Confusion Matrix [0,1]:\n", cm)
 
-        # 7) Save train/val stats in user test directory
-        stats_df = pd.DataFrame(STATS)
-        stats_path = os.path.join(user_test_dir, "train_stats.csv")
-        stats_df.to_csv(stats_path, index=False)
+            plt.figure(figsize=(4,3))
+            plt.imshow(cm, cmap='Blues')
+            plt.title(f"U{user_id} {label_col}\nth={best_thr:.2f} Acc={test_acc:.1f}%")
+            plt.colorbar()
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    plt.text(j, i, cm[i,j],
+                             ha='center', va='center',
+                             color='white' if cm[i,j] > cm.max()/2 else 'black')
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.tight_layout()
+            out_cm = os.path.join(label_subdir, f"cm_{best_thr:.2f}.png")
+            plt.savefig(out_cm)
+            plt.close()
 
-        # 8) Load best model => pick threshold from VAL => final test
-        classifier.load_state_dict(torch.load(best_path, map_location=device))
-        classifier.eval()
+            global_results.append({
+                'user_id': user_id,
+                'label_col': label_col,
+                'pos_count': pos_count,
+                'neg_count': neg_count,
+                'best_thr': best_thr,
+                'auc': auc_val,
+                'test_acc': test_acc,
+                'tn': tn,
+                'fp': fp,
+                'fn': fn,
+                'tp': tp
+            })
 
-        # -- FIRST: Evaluate on val to pick threshold
-        val_probs_all = []
-        val_labels_all = []
-        with torch.no_grad():
-            for (bpm_in, steps_in, pids, labels) in val_loader:
-                bpm_in   = bpm_in.to(device)
-                steps_in = steps_in.to(device)
-                labels   = labels.cpu().numpy()
-                logits   = classifier(bpm_in, steps_in)
-                probs    = torch.sigmoid(logits).cpu().numpy()
-
-                val_probs_all.extend(probs)
-                val_labels_all.extend(labels)
-
-        val_probs_all = np.array(val_probs_all)
-        val_labels_all = np.array(val_labels_all)
-
-        thresholds = np.linspace(0.0, 1.0, 101)
-        best_thr_acc_val = 0.0
-        best_thr = 0.5
-        for thr in thresholds:
-            preds_thr = (val_probs_all >= thr).astype(int)
-            acc_thr   = (preds_thr == val_labels_all).mean() * 100.0
-            if acc_thr > best_thr_acc_val:
-                best_thr_acc_val = acc_thr
-                best_thr = thr
-
-        # -- NOW: Evaluate on test with that threshold
-        test_probs = []
-        test_labels = []
-        with torch.no_grad():
-            for (bpm_in, steps_in, pids, labels) in test_loader:
-                bpm_in   = bpm_in.to(device)
-                steps_in = steps_in.to(device)
-                labels   = labels.cpu().numpy()
-                logits   = classifier(bpm_in, steps_in)
-                probs    = torch.sigmoid(logits).cpu().numpy()
-
-                test_probs.extend(probs)
-                test_labels.extend(labels)
-
-        test_probs  = np.array(test_probs)
-        test_labels = np.array(test_labels)
-
-        # Compute AUC
-        if len(np.unique(test_labels)) == 1:
-            auc_val = float('nan')
-        else:
-            auc_val = roc_auc_score(test_labels, test_probs)
-
-        # Evaluate at chosen threshold
-        test_preds = (test_probs >= best_thr).astype(int)
-        test_acc   = (test_preds == test_labels).mean() * 100.0
-        cm         = confusion_matrix(test_labels, test_preds, labels=[0,1])
-
-        tn, fp, fn, tp = cm.ravel()
-        print(f"\n[User {user_id}] => TEST with threshold from VAL={best_thr:.3f}")
-        print(f" - AUC = {auc_val:.4f} (NaN if all labels are the same)")
-        print(f" - Accuracy at threshold={best_thr:.3f} => {test_acc:.2f}%")
-        print("Confusion Matrix [0,1]:")
-        print(cm)
-
-        # Plot confusion matrix
-        plt.figure(figsize=(5,4))
-        plt.imshow(cm, cmap='Blues')
-        plt.title(f"User {user_id} CM (th={best_thr:.2f}) Acc={test_acc:.2f}%")
-        plt.colorbar()
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, cm[i, j],
-                         ha="center", va="center",
-                         color="white" if cm[i, j] > (cm.max()/2) else "black")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.tight_layout()
-        cm_path = os.path.join(user_test_dir, f"cm_threshold_{best_thr:.2f}.png")
-        plt.savefig(cm_path)
-        plt.close()
-
-        global_results.append({
-            'user_id': user_id,
-            'val_threshold': best_thr,
-            'auc': auc_val,
-            'accuracy': test_acc,
-            'tn': tn,
-            'fp': fp,
-            'fn': fn,
-            'tp': tp
-        })
-
-    # Summaries across all users
-    if len(global_results) > 0:
+    if global_results:
         results_df = pd.DataFrame(global_results)
-        results_csv = os.path.join("results", "test", "classification_summary.csv")
-        results_df.to_csv(results_csv, index=False)
-        print(f"\nSaved test summary => {results_csv}")
-
-        # Some quick prints
-        results_df_no_nan = results_df.dropna(subset=['auc'])
-        best_auc_df  = results_df_no_nan.sort_values('auc', ascending=False).head(5)
-        worst_auc_df = results_df_no_nan.sort_values('auc', ascending=True).head(5)
-
-        print("\nTop 5 Users by AUC:\n", best_auc_df)
-        print("\nWorst 5 Users by AUC:\n", worst_auc_df)
-
-        best_acc_df  = results_df.sort_values('accuracy', ascending=False).head(5)
-        print("\nTop 5 Users by Accuracy:\n", best_acc_df)
+        out_path = os.path.join("results", "test", "classification_summary.csv")
+        results_df.to_csv(out_path, index=False)
+        print(f"\nSaved final summary => {out_path}")
     else:
-        print("No classification results to summarize.")
+        print("No classification results produced.")
 
-    print("\nDone with final drug classification on test sets!\n")
-
+    print("\nDone with final classification!\n")
 
 if __name__ == "__main__":
     main()
