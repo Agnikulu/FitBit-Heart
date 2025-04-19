@@ -1,0 +1,7 @@
+data:
+  biosignal_dir: "data/Personalized AI Data/Biosignal"
+  label_root:    "data/Personalized AI Data/Label"
+  lifesnaps_csv: "data/lifesnaps.csv"
+
+results_root: "results"
+ssl_ckpt:     "results/saved_models/ssl_backbone.pth"
