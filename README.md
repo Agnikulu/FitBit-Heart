@@ -72,7 +72,7 @@
       nn.Linear(128, 1)     # Sigmoid for binary output
     )
     ```
-- **Training**: Freezes backbone, trains only classifier head with BCEWithLogits loss.  
+- **Training**: Partially unfreezes 30% of backbone via partially_unfreeze_backbone(model, unfreeze_ratio=0.3) in init_classifier_for_user, keeps remaining layers frozen.
 
 ---
 
@@ -127,64 +127,73 @@ Notes:
 
 **Full Classification Results** (`classification_summary.csv`):
 
-| user_id | label_col               | pos_count | neg_count | best_thr | auc                  | test_acc           | tn  | fp | fn | tp |
-|---------|-------------------------|-----------|-----------|----------|----------------------|--------------------|-----|----|----|----|
-| 5       | methamphetamine_crave_label | 4         | 25        | 0.51     | 0.50                 | 80.00              | 4   | 0  | 1  | 0  |
-| 9       | melon_crave_label       | 3         | 39        | 0.50     | —                    | 100.00             | 7   | 0  | 0  | 0  |
-| 10      | carrot_crave_label      | 18        | 59        | 0.41     | 0.593                | 75.00              | 8   | 1  | 2  | 1  |
-| 10      | carrot_use_label        | 18        | 59        | 0.37     | 0.556                | 66.67              | 6   | 3  | 1  | 2  |
-| 10      | nectarine_crave_label   | 16        | 61        | 0.46     | 0.45                 | 83.33              | 10  | 0  | 2  | 0  |
-| 10      | nectarine_use_label     | 16        | 61        | 0.35     | 0.70                 | 58.33              | 6   | 4  | 1  | 1  |
-| 12      | almond_use_label        | 2         | 85        | 0.45     | —                    | 100.00             | 14  | 0  | 0  | 0  |
-| 12      | ghb_crave_label         | 2         | 85        | 0.38     | —                    | 100.00             | 14  | 0  | 0  | 0  |
-| 12      | ghb_use_label           | 6         | 81        | 0.38     | 0.923                | 92.86              | 13  | 0  | 1  | 0  |
-| 12      | melon_crave_label       | 13        | 74        | 0.38     | 0.417                | 78.57              | 11  | 1  | 2  | 0  |
-| 12      | melon_use_label         | 34        | 53        | 0.43     | 0.333                | 35.71              | 3   | 6  | 3  | 2  |
-| 12      | nectarine_crave_label   | 11        | 76        | 0.48     | 0.417                | 85.71              | 12  | 0  | 2  | 0  |
-| 12      | nectarine_use_label     | 4         | 83        | 0.43     | 0.615                | 92.86              | 13  | 0  | 1  | 0  |
-| 13      | almond_use_label        | 9         | 45        | 0.54     | 0.125                | 88.89              | 8   | 0  | 1  | 0  |
-| 13      | carrot_crave_label      | 2         | 52        | 0.42     | —                    | 88.89              | 8   | 1  | 0  | 0  |
-| 13      | carrot_use_label        | 6         | 48        | 0.43     | 1.000                | 88.89              | 8   | 0  | 1  | 0  |
-| 13      | nectarine_use_label     | 28        | 26        | 0.47     | 0.80                 | 66.67              | 2   | 2  | 1  | 4  |
-| 14      | carrot_crave_label      | 18        | 70        | 0.44     | 0.303                | 78.57              | 11  | 0  | 3  | 0  |
-| 14      | carrot_use_label        | 48        | 40        | 0.00     | 0.771                | 57.14              | 0   | 6  | 0  | 8  |
-| 15      | carrot_crave_label      | 32        | 56        | 0.45     | 0.844                | 71.43              | 6   | 3  | 1  | 4  |
-| 15      | carrot_use_label        | 47        | 41        | 0.47     | 0.449                | 50.00              | 3   | 4  | 3  | 4  |
-| 18      | carrot_crave_label      | 25        | 64        | 0.46     | 0.775                | 64.29              | 7   | 3  | 2  | 2  |
-| 18      | carrot_use_label        | 3         | 86        | 0.40     | —                    | 100.00             | 14  | 0  | 0  | 0  |
-| 19      | almond_crave_label      | 4         | 49        | 0.38     | 0.571                | 87.50              | 7   | 0  | 1  | 0  |
-| 19      | almond_use_label        | 6         | 47        | 0.39     | 0.429                | 87.50              | 7   | 0  | 1  | 0  |
-| 19      | melon_crave_label       | 4         | 49        | 0.44     | 0.286                | 87.50              | 7   | 0  | 1  | 0  |
-| 19      | melon_use_label         | 26        | 27        | 0.52     | 0.438                | 37.50              | 1   | 3  | 2  | 2  |
-| 20      | melon_crave_label       | 10        | 28        | 0.45     | 0.50                 | 50.00              | 3   | 1  | 2  | 0  |
-| 20      | melon_use_label         | 9         | 29        | 0.52     | 1.000                | 100.00             | 5   | 0  | 0  | 1  |
-| 20      | nectarine_crave_label   | 8         | 30        | 0.46     | 0.40                 | 66.67              | 4   | 1  | 1  | 0  |
-| 20      | nectarine_use_label     | 8         | 30        | 0.46     | 0.20                 | 83.33              | 5   | 0  | 1  | 0  |
-| 25      | almond_use_label        | 4         | 59        | 0.44     | 0.556                | 90.00              | 9   | 0  | 1  | 0  |
-| 27      | melon_crave_label       | 13        | 50        | 0.41     | 0.50                 | 80.00              | 8   | 0  | 2  | 0  |
-| 27      | melon_use_label         | 14        | 49        | 0.43     | 0.50                 | 60.00              | 6   | 2  | 2  | 0  |
-| 27      | nectarine_crave_label   | 20        | 43        | 0.43     | 0.762                | 60.00              | 4   | 3  | 1  | 2  |
-| 27      | nectarine_use_label     | 13        | 50        | 0.44     | 0.75                 | 90.00              | 8   | 0  | 1  | 1  |
-| 28      | almond_use_label        | 12        | 68        | 0.45     | 0.75                 | 83.33              | 10  | 0  | 2  | 0  |
-| 28      | caffeine_use_label     | 12        | 68        | 0.42     | 0.30                 | 83.33              | 10  | 0  | 2  | 0  |
-| 28      | carrot_use_label        | 2         | 78        | 0.39     | —                    | 91.67              | 11  | 1  | 0  | 0  |
-| 28      | coffee_use_label        | 7         | 73        | 0.39     | 0.636                | 66.67              | 8   | 3  | 1  | 0  |
-| 33      | nectarine_use_label     | 44        | 8         | 0.00     | 0.857                | 87.50              | 0   | 1  | 0  | 7  |
-| 35      | nectarine_use_label     | 29        | 20        | 0.48     | 0.533                | 50.00              | 2   | 1  | 3  | 2  |
-| 35      | orange_use_label        | 8         | 41        | 0.49     | 0.429                | 87.50              | 7   | 0  | 1  | 0  |
+| user_id | label_col | pos_count | neg_count | best_thr | auc | test_acc | tn | fp | fn | tp |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 5 | methamphetamine_crave_label | 5 | 24 | 0.41 | 0.75 | 60.00 | 3 | 1 | 1 | 0 |
+| 9 | methamphetamine_crave_label | 3 | 39 | 0.46 | — | 100.00 | 7 | 0 | 0 | 0 |
+| 10 | cannabis_crave_label | 18 | 59 | 0.29 | 0.63 | 75.00 | 7 | 2 | 1 | 2 |
+| 10 | cannabis_use_label | 18 | 59 | 0.25 | 0.11 | 58.33 | 7 | 2 | 3 | 0 |
+| 10 | nicotine_crave_label | 16 | 61 | 0.27 | 0.50 | 50.00 | 6 | 4 | 2 | 0 |
+| 10 | nicotine_use_label | 16 | 61 | 0.22 | 0.75 | 58.33 | 6 | 4 | 1 | 1 |
+| 12 | alcohol_use_label | 2 | 85 | 0.18 | — | 85.71 | 12 | 2 | 0 | 0 |
+| 12 | ghb_crave_label | 2 | 85 | 0.21 | — | 100.00 | 14 | 0 | 0 | 0 |
+| 12 | ghb_use_label | 6 | 81 | 0.21 | 0.92 | 92.86 | 13 | 0 | 1 | 0 |
+| 12 | methamphetamine_crave_label | 13 | 74 | 0.33 | 0.83 | 78.57 | 11 | 1 | 2 | 0 |
+| 12 | methamphetamine_use_label | 34 | 53 | 0.42 | 0.36 | 35.71 | 5 | 4 | 5 | 0 |
+| 12 | nicotine_crave_label | 11 | 76 | 0.27 | 0.46 | 85.71 | 12 | 0 | 2 | 0 |
+| 12 | nicotine_use_label | 4 | 83 | 0.28 | 0.31 | 92.86 | 13 | 0 | 1 | 0 |
+| 13 | alcohol_use_label | 9 | 45 | 0.42 | 0.00 | 88.89 | 8 | 0 | 1 | 0 |
+| 13 | cannabis_crave_label | 2 | 52 | 0.28 | — | 100.00 | 9 | 0 | 0 | 0 |
+| 13 | cannabis_use_label | 6 | 48 | 0.33 | 0.50 | 88.89 | 8 | 0 | 1 | 0 |
+| 13 | nicotine_use_label | 28 | 26 | 0.46 | 0.80 | 77.78 | 2 | 2 | 0 | 5 |
+| 14 | cannabis_crave_label | 18 | 70 | 0.42 | 0.91 | 78.57 | 11 | 0 | 3 | 0 |
+| 14 | cannabis_use_label | 48 | 40 | 0.00 | 0.50 | 57.14 | 0 | 6 | 0 | 8 |
+| 15 | cannabis_crave_label | 32 | 56 | 0.35 | 0.27 | 35.71 | 3 | 6 | 3 | 2 |
+| 15 | cannabis_use_label | 47 | 41 | 0.00 | 0.53 | 50.00 | 0 | 7 | 0 | 7 |
+| 18 | cannabis_crave_label | 25 | 64 | 0.29 | 0.73 | 57.14 | 5 | 5 | 1 | 3 |
+| 18 | cannabis_use_label | 3 | 86 | 0.20 | — | 100.00 | 14 | 0 | 0 | 0 |
+| 19 | alcohol_crave_label | 4 | 49 | 0.25 | 0.29 | 75.00 | 6 | 1 | 1 | 0 |
+| 19 | alcohol_use_label | 6 | 47 | 0.28 | 1.00 | 87.50 | 7 | 0 | 1 | 0 |
+| 19 | methamphetamine_crave_label | 4 | 49 | 0.20 | 0.86 | 87.50 | 6 | 1 | 0 | 1 |
+| 19 | methamphetamine_use_label | 26 | 27 | 0.47 | 0.63 | 62.50 | 1 | 3 | 0 | 4 |
+| 20 | methamphetamine_crave_label | 10 | 28 | 0.55 | 0.50 | 66.67 | 4 | 0 | 2 | 0 |
+| 20 | methamphetamine_use_label | 9 | 29 | 0.41 | 1.00 | 33.33 | 1 | 4 | 0 | 1 |
+| 20 | nicotine_crave_label | 8 | 30 | 0.45 | 0.40 | 66.67 | 4 | 1 | 1 | 0 |
+| 20 | nicotine_use_label | 8 | 30 | 0.46 | 0.80 | 83.33 | 4 | 1 | 0 | 1 |
+| 25 | alcohol_use_label | 4 | 59 | 0.30 | 0.67 | 90.00 | 9 | 0 | 1 | 0 |
+| 27 | methamphetamine_crave_label | 13 | 50 | 0.27 | 0.88 | 80.00 | 7 | 1 | 1 | 1 |
+| 27 | methamphetamine_use_label | 14 | 49 | 0.41 | 0.38 | 80.00 | 8 | 0 | 2 | 0 |
+| 27 | nicotine_crave_label | 20 | 43 | 0.42 | 0.71 | 60.00 | 5 | 2 | 2 | 1 |
+| 27 | nicotine_use_label | 13 | 50 | 0.50 | 0.81 | 80.00 | 8 | 0 | 2 | 0 |
+| 28 | alcohol_use_label | 12 | 68 | 0.22 | 0.30 | 58.33 | 7 | 3 | 2 | 0 |
+| 28 | caffeine_use_label | 12 | 68 | 0.18 | 0.30 | 75.00 | 9 | 1 | 2 | 0 |
+| 28 | cannabis_use_label | 2 | 78 | 0.21 | — | 100.00 | 12 | 0 | 0 | 0 |
+| 28 | coffee_use_label | 7 | 73 | 0.19 | 0.73 | 91.67 | 11 | 0 | 1 | 0 |
+| 33 | nicotine_use_label | 44 | 8 | 0.00 | 1.00 | 87.50 | 0 | 1 | 0 | 7 |
+| 35 | nicotine_use_label | 29 | 20 | 0.49 | 0.87 | 75.00 | 2 | 1 | 1 | 4 |
+| 35 | opioid_use_label | 8 | 41 | 0.47 | 0.14 | 87.50 | 7 | 0 | 1 | 0 |
 
-- **Average AUC** (across 37 valid entries): **0.57**  
-- **Average Accuracy** (across all 43 models): **77.5%**  
+**Aggregate Metrics**
 
-**Key Observations**:
-- Highest AUC: **1.00** (`carrot_use_label` for User 13, `melon_use_label` for User 20)  
-- Most Imbalanced Case: User 33 (`nectarine_use_label`, 44 positives vs 8 negatives)  
-- Thresholds ranged from **0.00** (maximize recall) to **0.54** (prioritize precision)  
-- 6/43 models had insufficient class diversity for AUC calculation  
+| Metric | Value |
+|--------|-------|
+| **Average AUC** (37 valid models) | **0.60** |
+| **Average Accuracy** (all 43 models) | **75.23 %** |
 
 ---
 
-## **4. Critical Comparison with Original Paper**  
+## **4 . Key Observations**  
+
+1. **Best‑case AUC = 1.00** achieved by  
+   - *alcohol_use* for **User 19**  
+   - *methamphetamine_use* for **User 20**  
+2. **Worst‑case AUC ≈ 0.11** (*cannabis_use*, User 10) – heavy class imbalance and noisy HR patterns.  
+3. Thresholds span **0.00 → 0.55**; models with `thr ≈ 0.00` maximise recall at the cost of precision.  
+4. Substances with very few positives (e.g. opioid_use) still reach high accuracy due to skewed negative class.  
+
+---
+
+## **5. Critical Comparison with Original Paper**  
 
 | **Aspect**         | **Paper**                          | **This Implementation**         |  
 |--------------------|------------------------------------|---------------------------------|  
@@ -192,22 +201,7 @@ Notes:
 | **Windowing**      | 12-hour windows                    | 6-hour windows                  |  
 | **SSL Approach**   | Contrastive learning               | Future biosignal prediction     |  
 | **Classification** | 1D-CNN + Brier score               | CNN-LSTM + BCEWithLogits        |  
-| **AUC**            | 0.729 (SSL)                        | ~0.68 (current run)             |  
-| **Accuracy**       | ~70%                               | ~78.5% (average, dynamic thr)   |  
-
----
-
-## **5. Limitations & Recommendations**  
-_(Updated based on full results)_  
-
-### **5.1 Identified Issues**  
-1. **Threshold Sensitivity**: Optimal thresholds varied wildly (0.00 to 0.54), complicating deployment.  
-2. **Substance-Specific Performance**: Models for "GHB" and "Methamphetamine" showed strong performance (AUC >0.9), while "Coffee" and "Caffeine" struggled (AUC <0.65).  
-3. **Edge Cases**: For `best_thr=0.00`, models predicted positive class exclusively but still achieved 57-88% accuracy due to class imbalance.
-
-### **5.2 Proposed Fixes**  
-1. **Meta-Learning for Thresholds**: Train a threshold-selector model using substance type and class balance as inputs.  
-2. **Cross-Substance Transfer**: Initialize weights for poorly performing substances (e.g., coffee) with models from similar substances (e.g., caffeine).  
-3. **Uncertainty Quantification**: Add prediction confidence intervals to handle edge cases.  
+| **AUC**            | 0.729 (SSL)                        | ~0.60 (current run)             |  
+| **Accuracy**       | ~70%                               | ~75.23% (average, dynamic thr)  |  
 
 --- 
