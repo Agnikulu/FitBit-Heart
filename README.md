@@ -317,10 +317,10 @@
 
 **Overall Averages Across All Scenarios**
 
-| Version            | Sensitivity | Specificity | Accuracy |
-|--------------------|------------:|------------:|---------:|
-| **Original Paper** |     51.1 %  |     66.0 %  |   70.8 % |
-| **Ours**           |     26.6 %  |     85.5 %  |   78.3 % |
+| Version            | Sensitivity | Specificity | Accuracy | AUC |
+|--------------------|------------:|------------:|---------:|----:|
+| **Original Paper** |     51.1 %  |     66.0 %  |   70.8 % |   — |
+| **Ours**           |     62.2 %  |     50.0 %  |   53.2 % |0.635|
 
 *Note: “—” indicates cases with no positive samples (sensitivity undefined) or no AUC computed.*
 
