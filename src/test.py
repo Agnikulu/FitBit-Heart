@@ -8,9 +8,9 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_auc_score
 from torch.utils.data import Dataset, DataLoader, RandomSampler
+from sklearn.model_selection import train_test_split
 
 from src.config import load_config
 import src.utils as U
@@ -89,27 +89,46 @@ def main():
             print(f"[User {uid}] Insufficient data – skipping")
             continue
 
+        # --- split raw records into chronological train_val vs test ---
+        n = len(df_u)
+        test_frac = 0.15
+        cut = int((1 - test_frac) * n)
+        df_train_val = df_u.iloc[:cut]
+        df_test      = df_u.iloc[cut:]
+
         for lbl in lbl_cols:
-            samples = make_samples(df_u, lbl, cfg.window.size)
-            if len(samples) < 15:
+            # 4a) create windows only after splitting
+            samples_tv   = make_samples(df_train_val, lbl, cfg.window.size)
+            samples_test = make_samples(df_test,      lbl, cfg.window.size)
+
+            # catch empty test-window case
+            if len(samples_test) == 0:
+                print(f"[U{uid}|{lbl}] WARNING: test slice too short for window → skipping")
                 continue
 
-            y = np.array([s["label"] for s in samples])
-            # require at least 2 positives and 2 negatives overall
-            if y.sum() < 2 or (len(y) - y.sum()) < 2:
+            # require enough windows in train_val to stratify
+            if len(samples_tv) < 15:
+                continue
+            y_tv = np.array([s["label"] for s in samples_tv])
+            if y_tv.sum() < 2 or (len(y_tv) - y_tv.sum()) < 2:
                 continue
 
-            # train/val/test split (70/15/15)
-            idx = np.arange(len(samples))
-            idx_tv, idx_test = train_test_split(
-                idx, test_size=0.15, stratify=y, random_state=cfg.seed
+            # 5) split train_val windows into train / val
+            idx = np.arange(len(samples_tv))
+            idx_tv, idx_val = train_test_split(
+                idx,
+                test_size=test_frac / (1 - test_frac),
+                stratify=y_tv,
+                random_state=cfg.seed
             )
-            val_frac = 0.15 / 0.85
             idx_train, idx_val = train_test_split(
-                idx_tv, test_size=val_frac, stratify=y[idx_tv], random_state=cfg.seed
+                idx_tv,
+                test_size=test_frac / (1 - test_frac),
+                stratify=y_tv[idx_tv],
+                random_state=cfg.seed
             )
 
-            def mk_loader(indices, shuffle):
+            def mk_loader(samples, indices, shuffle):
                 ds = CraveDataset([samples[i] for i in indices])
                 return DataLoader(
                     ds,
@@ -117,35 +136,34 @@ def main():
                     sampler=RandomSampler(ds) if shuffle else None
                 )
 
-            train_loader = mk_loader(idx_train, True)
-            val_loader   = mk_loader(idx_val,   False)
-            test_loader  = mk_loader(idx_test,  False)
+            train_loader = mk_loader(samples_tv, idx_train, True)
+            val_loader   = mk_loader(samples_tv, idx_val,   False)
+            test_loader  = DataLoader(
+                CraveDataset(samples_test),
+                batch_size=cfg.test.batch_size,
+                shuffle=False
+            )
 
-            # 5) Build model & load personalized SSL weights
+            # 6) Build model & load SSL weights
             model = DrugClassifier(window_size=cfg.window.size).to(device)
             ckpt  = os.path.join(cfg.results_root, "train", f"user_{uid}", "personalized_ssl.pt")
             if os.path.isfile(ckpt):
                 ssl_sd   = torch.load(ckpt, map_location="cpu")
                 model_sd = model.state_dict()
-                matched  = {
-                    k: v for k, v in ssl_sd.items()
-                    if k in model_sd and v.shape == model_sd[k].shape
-                }
+                matched  = {k: v for k, v in ssl_sd.items()
+                            if k in model_sd and v.shape == model_sd[k].shape}
                 model_sd.update(matched)
                 model.load_state_dict(model_sd)
                 print(f"[U{uid}] Transferred {len(matched)}/{len(model_sd)} layers")
             else:
                 print(f"[U{uid}] No SSL checkpoint – random init")
 
-            # 6) Unfreeze classifier head + LSTM layers
+            # 7) Freeze all but classifier & LSTM
             for name, param in model.named_parameters():
-                if "classifier" in name or "lstm" in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+                param.requires_grad = ("classifier" in name or "lstm" in name)
 
-            # 7) Weighted loss to counter class imbalance in training set
-            train_labels = np.array([samples[i]["label"] for i in idx_train])
+            # 8) Compute class‐weight from train only
+            train_labels = np.array([samples_tv[i]["label"] for i in idx_train])
             pos = max(train_labels.sum(), 1)
             neg = max(len(train_labels) - pos, 1)
             pos_weight = torch.tensor([neg / pos], device=device)
@@ -164,7 +182,7 @@ def main():
                 verbose=True
             )
 
-            # 8) Train/validate loop
+            # 9) Train/val loop
             best_val, no_imp = float("inf"), 0
             lbl_dir = os.path.join(user_dir, lbl)
             os.makedirs(lbl_dir, exist_ok=True)
@@ -188,7 +206,7 @@ def main():
                     tr_loss += loss.item()
                 tr_loss /= len(train_loader)
 
-                # — VALIDATE —
+                # — VAL —
                 model.eval()
                 val_loss, preds, gts = 0.0, [], []
                 with torch.no_grad():
@@ -202,9 +220,7 @@ def main():
                 acc_val = ((np.array(preds) >= 0.5) == np.array(gts)).mean() * 100
                 print(f"[U{uid}|{lbl}] ep{ep:02d} tr{tr_loss:.4f} vl{val_loss:.4f} acc{acc_val:5.1f}%")
 
-                # step scheduler on validation loss
                 scheduler.step(val_loss)
-
                 if val_loss < best_val:
                     best_val, no_imp = val_loss, 0
                     torch.save(model.state_dict(), best_ck)
@@ -215,7 +231,7 @@ def main():
                 continue
             model.load_state_dict(torch.load(best_ck, map_location=device))
 
-            # 9) Select best threshold on validation set
+            # 10) Select threshold by maximizing Youden's J (sens + spec – 1) on val
             pv, yv = [], []
             model.eval()
             with torch.no_grad():
@@ -224,10 +240,18 @@ def main():
                     pv.extend(torch.sigmoid(logits).cpu().tolist())
                     yv.extend(tgt.cpu().tolist())
             pv, yv = np.array(pv), np.array(yv)
-            best_thr = max(np.linspace(0, 1, 101),
-                           key=lambda t: ((pv >= t) == yv).mean())
 
-            # 10) Final test evaluation
+            best_j, best_thr = -1, 0.5
+            for t in np.linspace(0, 1, 101):
+                preds_t = (pv >= t).astype(int)
+                tn, fp, fn, tp = confusion_matrix(yv, preds_t, labels=[0, 1]).ravel()
+                sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+                spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+                j = sens + spec - 1
+                if j > best_j:
+                    best_j, best_thr = j, t
+
+            # 11) Final test evaluation
             pt, yt = [], []
             with torch.no_grad():
                 for bpm, steps, _id, tgt in test_loader:
@@ -239,43 +263,43 @@ def main():
             pred = (pt >= best_thr).astype(int)
             acc  = (pred == yt).mean() * 100
             tn, fp, fn, tp = confusion_matrix(yt, pred, labels=[0, 1]).ravel()
-
-            # Compute sensitivity and specificity
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+            sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+            spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
 
             print(f"[U{uid}|{lbl}] TEST thr={best_thr:.2f} acc={acc:.2f}% auc={auc:.3f} "
-                  f"sens={sensitivity:.3f} spec={specificity:.3f}")
+                  f"sens={sens:.3f} spec={spec:.3f}")
 
-            # Plot & save confusion matrix
+            # save confusion matrix
             plt.figure(figsize=(3, 3))
             plt.imshow([[tn, fp], [fn, tp]], cmap="Blues")
             for i, v in enumerate([tn, fp, fn, tp]):
                 plt.text(i % 2, i // 2, str(v),
                          ha="center", va="center",
-                         color="white" if v > max(tn, fp, fn, tp) / 2 else "black")
+                         color="white" if v > max(tn, fp, fn, tp)/2 else "black")
             plt.title(f"U{uid} {lbl}\nth={best_thr:.2f} acc={acc:.1f}%")
             plt.tight_layout()
             plt.savefig(os.path.join(lbl_dir, f"cm_{best_thr:.2f}.png"))
             plt.close()
 
+            # record results on test set windows only
             all_results.append({
-                "user_id":   uid,
-                "label_col": lbl,
-                "pos":       int(yt.sum()),
-                "neg":       int(len(yt) - yt.sum()),
-                "thr":       best_thr,
-                "auc":       auc,
-                "acc":       acc,
-                "tn":        tn,
-                "fp":        fp,
-                "fn":        fn,
-                "tp":        tp,
-                "sensitivity": sensitivity,
-                "specificity": specificity
+                "user_id":     uid,
+                "label_col":   lbl,
+                "n_test":      len(yt),           # total test windows
+                "pos":         int(yt.sum()),     # positives in test
+                "neg":         int(len(yt) - yt.sum()),  # negatives in test
+                "thr":         best_thr,
+                "auc":         auc,
+                "acc":         acc,
+                "tn":          tn,
+                "fp":          fp,
+                "fn":          fn,
+                "tp":          tp,
+                "sensitivity": sens,
+                "specificity": spec
             })
 
-    # 11) Save summary CSV
+    # 12) Save summary CSV
     if all_results:
         pd.DataFrame(all_results).to_csv(
             os.path.join(res_root, "classification_summary.csv"),
