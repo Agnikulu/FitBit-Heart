@@ -42,24 +42,156 @@
 
 ## **2. Model Architectures**  
 
+## **2. Model Architectures**  
+
 ### **2.1 SSLForecastingModel with Self‑Attention**  
-*… (unchanged) …*
+- **Goal**: Learn general biosignal dynamics by predicting future windows, yielding transferable features.  
+- **Structure**:  
+  1. **Shared Encoders for BPM & Steps**  
+     ```python
+     # CNN feature extractor
+     Conv1d(1→32, k=3, p=1) → BatchNorm → ReLU → Dropout
+     Conv1d(32→64, k=3, p=1) → BatchNorm → ReLU → Dropout
+     # RNN aggregator
+     GRU(64→128, num_layers=2, batch_first=True)
+     ```
+     - Input: flatten 2 windows ([B,2,6]→[B,1,12]) → CNN → GRU → last hidden ([B,128]).  
+  2. **Current‑Window Embeddings**  
+     ```python
+     Linear(6→16) → ReLU → Dropout   # BPM
+     Linear(6→16) → ReLU → Dropout   # Steps
+     → Concatenate (32) → Linear(32→256)
+     ```
+     - Produces one 256‑dim “current‑window” token per future window.  
+  3. **Token Sequence & Positional Encoding**  
+     - Tokens: `[past_summary, curr_tok_1, …, curr_tok_P]` → shape `[B, P+1, 256]`.  
+     - Positional Embedding: `Embedding(P+1,256)` added to tokens.  
+  4. **Self‑Attention Module**  
+     ```python
+     MultiheadAttention(embed_dim=256, num_heads=cfg.model.attn_heads, batch_first=True)
+     LayerNorm & Residual
+     Feed‑Forward (256→256→256) → LayerNorm & Residual
+     ```
+     - Captures inter‑window dependencies among past summary and all current windows.  
+  5. **Prediction Heads**  
+     ```python
+     Linear(256→6)  # BPM forecast per window
+     Linear(256→6)  # Steps forecast per window
+     ```
+     - Decodes each updated token back into a 6‑hour forecast.  
 
 ### **2.2 PersonalizedForecastingModel**  
-*… (unchanged) …*
+- **Fine‑Tuning**: Same architecture as SSL model.  
+- **Transfer Learning**:  
+  - Load SSL‑pretrained weights.  
+  - **Freezing Strategy**: Freeze _all_ parameters except:  
+    - Multi‑head attention (`attn.*`)  
+    - Feed‑forward blocks (`ffn.*`)  
+    - Fusion heads (`fusion_bpm`, `fusion_steps`)  
+    - Current‑window projection layers (`agg_current_*`)  
+    - Positional embeddings  
+  - Focuses adaptation on the modules that integrate past + current windows.  
 
 ### **2.3 DrugClassifier**  
-*… (unchanged) …*
+- **Purpose**: Binary classification of use/crave events using the pretrained backbone.  
+- **Architecture**:  
+  - **Shared CNN+GRU Branches** (identical to forecasting encoders, no attention).  
+  - **Classifier Head**:  
+    ```python
+    # after concatenating bpm_hidden & steps_hidden → [B,256]:
+    Linear(256→128) → ReLU → Dropout
+    Linear(128→1)
+    ```  
+  - Sigmoid‑based binary output.  
+- **Fine‑Tuning**:  
+  - Unfreeze the **last 30%** of backbone layers (the deepest CNN+GRU blocks) **and** the classifier head, freeze the rest.  
+- **Why No Attention?**  
+  - Each input is just a single 6 h block (a 1×6 sequence of two signals): our CNN+GRU captures those six time‑step patterns effectively.  
+  - The SSL forecasting task, by contrast, must fuse a “past” summary plus multiple “current” windows (several 6 h chunks) simultaneously—an inherently multi‑token scenario that benefits from self‑attention.  
+- **Handling Class Imbalance via Sliding Windows**:  
+  - When positive labels (e.g. “crave”) are very rare, we **augment positives** by switching from non‑overlapping 6 h blocks to an **overlapping sliding‑window** during **training only**:  
+    ```python
+    # Non‑overlap stride = window_size (e.g. 6 h):
+    for i in range(0, len(df), win):
+      chunk = df[i:i+win]
+      ...
+    
+    # Sliding‑window stride < window_size (e.g. 1 h):
+    for i in range(0, len(df)-win+1, stride):
+      chunk = df[i:i+win]
+      ...
+    ```  
+  - Each true positive hour now appears in up to `window_size/stride` windows, multiplying positive samples (e.g. 6× more if stride=1 h) while only modestly increasing negatives.  
+  - **Train** on these overlapping windows to expose the classifier to many more positive examples. **Evaluate** on the original non‑overlapping blocks to keep metrics comparable.  
+  - This strategy dramatically **improves the effective class balance** in training batches, helping the classifier learn from scarce “use”/“crave” events without overfitting.
 
 ---
 
 ## **3. Training Procedures**  
 
 ### **3.1 SSL Pretraining**  
-*… (unchanged) …*
+- **Data**: `data/lifesnaps.csv` (external dataset).  
+- **Hyperparameters**:  
+  - **Optimizer**: Adam (lr=1e‑3, weight_decay=1e‑5)  
+  - **Loss**: SmoothL1, weighted by BPM/steps scales (α,β).  
+  - **Scheduler**: ReduceLROnPlateau (factor=0.5, patience=5, min_lr=1e‑6).  
+  - **Epochs**: up to 100, early‑stop if no val‑improve for 20 epochs.  
+- **Results** (`results/pretrain/stats_pretrain.csv`):  
+
+| Epoch | Train Loss | Val Loss | BPM MAE | Steps MAE |
+|:-----:|:----------:|:--------:|:-------:|:---------:|
+| 1  | 0.17 | 0.05 | 2.99  | 218.49 |
+| 2  | 0.09 | 0.04 | 2.35  | 178.10 |
+| 3  | 0.09 | 0.04 | 2.52  | 149.58 |
+| 4  | 0.08 | 0.03 | 2.38  | 135.38 |
+| 5  | 0.08 | 0.03 | 2.55  | 130.51 |
+| 6  | 0.08 | 0.04 | 2.62  | 120.34 |
+| 7  | 0.07 | 0.04 | 2.61  | 114.26 |
+| 8  | 0.07 | 0.04 | 2.69  | 113.21 |
+| 9  | 0.07 | 0.04 | 2.79  | 115.30 |
+| 10 | 0.07 | 0.03 | 2.51  | 114.15 |
+| 11 | 0.07 | 0.03 | 2.57  | 113.31 |
+| 12 | 0.07 | 0.04 | 2.67  | 106.61 |
+| 13 | 0.07 | 0.03 | 2.41  | 111.65 |
+| 14 | 0.07 | 0.03 | 2.59  | 104.40 |
+| 15 | 0.06 | 0.03 | 2.58  | 102.49 |
+| 16 | 0.06 | 0.03 | 2.50  | 102.96 |
+| 17 | 0.06 | 0.03 | 2.58  |  98.72 |
+| 18 | 0.06 | 0.03 | 2.56  | 106.54 |
+| 19 | 0.06 | 0.04 | 2.65  | 105.02 |
+| 20 | 0.06 | 0.03 | 2.60  | 100.91 |
+| 21 | 0.06 | 0.04 | 2.68  |  96.49 |
+| 22 | 0.06 | 0.04 | 2.68  | 102.46 |
+| 23 | 0.06 | 0.04 | 2.70  | 103.85 |
+| 24 | 0.06 | 0.04 | 2.67  | 106.69 |
 
 ### **3.2 Personalized Fine‑Tuning**  
-*… (unchanged) …*
+- **Per‑User Split**: 80% train, 20% val of forecasting samples.  
+- **Hyperparameters**:  
+  - lr=1e‑4, batch_size=64, patience=10, StepLR(γ=0.1, step=10).  
+  - **Freezing**: _All_ backbone layers frozen except attention, FFN, fusion heads, `agg_current_*`, and positional embeddings.  
+- **Summary** (`results/train/personalized_finetune_summary.csv`):  
+
+| User ID | BPM MAE | Steps MAE |
+|:-------:|:-------:|:---------:|
+| 5   | 2.69 | 112.07 |
+| 9   | 2.93 | 288.86 |
+| 10  | 2.82 |  99.48 |
+| 12  | 2.29 | 294.86 |
+| 13  | 4.30 | 123.96 |
+| 14  | 4.06 | 169.90 |
+| 15  | 2.35 | 129.35 |
+| 18  | 4.76 |  72.00 |
+| 19  | 1.95 |  56.56 |
+| 20  | 2.14 | 181.97 |
+| 25  | 2.44 | 117.80 |
+| 27  | 3.81 | 102.85 |
+| 28  | 2.87 | 151.12 |
+| 29  | 4.78 | 177.82 |
+| 31  | 6.18 |  92.37 |
+| 32  | 2.15 | 145.40 |
+| 33  | 2.43 | 112.59 |
+| 35  | 3.30 | 153.43 |
 
 ### **3.3 Substance Use Classification**  
 - **Setup**: 70/15/15 train/val/test splits per substance‑event pair, applied to raw hourly data *before* windowing.  
