@@ -99,6 +99,11 @@
     ```
   - Sigmoid‑based binary output.  
 - **Fine‑Tuning**: Unfreeze 30% of backbone layers (last CNN+GRU layers and classifier head).  
+- **Why No Attention?** The core reason we didn’t give the DrugClassifier its own attention block is that its “input” is just a single 6‑hour window (i.e. a 1×6 sequence of two features), and our CNN+RNN backbone already does a pretty good job of extracting the temporal patterns over those six time‑steps. In contrast, the SSL forecasting model is dealing with:
+  - a “past” history of multiple concatenated windows
+  - a series of “current” windows it needs to fuse simultaneously
+  - the need to attend differently to each of those windows
+so there’s a clear multi‑token structure that benefits from self‑attention.
 
 ---
 
@@ -147,26 +152,28 @@
   - **Freezing**: _All_ backbone layers frozen except attention, FFN, fusion heads, `curr_proj` & `pos_emb`.  
 - **Summary** (`results/train/personalized_finetune_summary.csv`):  
 
+**Updated Personalized Fine‑Tuning Summary** (`results/train/personalized_finetune_summary.csv`)
+
 | User ID | BPM MAE | Steps MAE |
 |:-------:|:-------:|:---------:|
-| 5  | 0.19 |  8.00 |
-| 9  | 0.27 | 26.26 |
-| 10 | 0.12 |  4.33 |
-| 12 | 0.09 | 11.79 |
-| 13 | 0.39 | 11.27 |
-| 14 | 0.34 | 14.16 |
-| 15 | 0.08 |  4.31 |
-| 18 | 0.37 |  5.54 |
-| 19 | 0.07 |  1.89 |
-| 20 | 0.19 | 16.54 |
-| 25 | 0.22 | 10.71 |
-| 27 | 0.35 |  9.35 |
-| 28 | 0.26 | 13.74 |
-| 29 | 0.43 | 16.17 |
-| 31 | 0.56 |  8.40 |
-| 32 | 0.18 | 12.12 |
-| 33 | 0.20 |  9.38 |
-| 35 | 0.30 | 13.95 |
+| 5       | 2.69    | 112.07    |
+| 9       | 2.93    | 288.86    |
+| 10      | 2.82    | 99.48     |
+| 12      | 2.29    | 294.86    |
+| 13      | 4.30    | 123.96    |
+| 14      | 4.06    | 169.90    |
+| 15      | 2.35    | 129.35    |
+| 18      | 4.76    | 72.00     |
+| 19      | 1.95    | 56.56     |
+| 20      | 2.14    | 181.97    |
+| 25      | 2.44    | 117.80    |
+| 27      | 3.81    | 102.85    |
+| 28      | 2.87    | 151.12    |
+| 29      | 4.78    | 177.82    |
+| 31      | 6.18    | 92.37     |
+| 32      | 2.15    | 145.40    |
+| 33      | 2.43    | 112.59    |
+| 35      | 3.30    | 153.43    |
 
 ### **3.3 Substance Use Classification**  
 - **Setup**: 70/15/15 train/val/test splits per substance‑event pair.  
