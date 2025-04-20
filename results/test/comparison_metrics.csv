@@ -1,0 +1,5 @@
+Metric,Original,This Study
+Accuracy,0.708,0.7001607407267785
+Sensitivity,0.511,0.52
+Specificity,0.66,0.705953061613439
+AUC,,0.6488924963924965

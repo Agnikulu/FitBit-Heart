@@ -1,36 +1,12 @@
-# configs/train.yaml
-
-seed: 42
-device: "cuda"
-
-data:
-  biosignal_dir: "data/Personalized AI Data/Biosignal"
-
-results_root: "results"
-ssl_ckpt:     "results/saved_models/ssl_backbone.pth"
-
-window:
-  size:            6
-  input_windows:   2
-  predict_windows: 1
-
-model:
-  attn_heads:    1
-  dropout:       0.3
+defaults:
+  - global
 
 train:
-  batch_size:     64
-  num_epochs:     30
-
-  # after this many val‐epochs with NO IMPROVEMENT, **stop** training
-  patience:       10  
-
-  # optimizer
-  lr:             1e-4
-
-  # ReduceLROnPlateau scheduler
+  batch_size:  64
+  num_epochs:  75
+  patience:    10
+  lr:          1e-4
   scheduler:
-    patience:     5
-    factor:       0.5
-    min_lr:       1e-6
-    gamma:     
+    patience: 5
+    factor:   0.5
+    min_lr:   1e-6

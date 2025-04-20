@@ -1,24 +1,13 @@
-# configs/test.yaml
-
-seed: 42
-device: "cuda"
-
-data:
-  biosignal_dir: "data/Personalized AI Data/Biosignal"
-  label_root:    "data/Personalized AI Data/Label"
-
-results_root: "results"
-
-window:
-  size: 6
+defaults:
+  - global
 
 test:
   batch_size:     32
   lr:             1e-3
-  num_epochs:     20
-  patience:       5     # early‐stop on validation loss
-  unfreeze_ratio: 0.30  # *not used* in head‐only regime
+  num_epochs:     50
+  patience:       5
+  unfreeze_ratio: 0.30
   scheduler:
-    patience:     3
-    factor:       0.5
-    min_lr:       1e-6
+    patience: 3
+    factor:   0.5
+    min_lr:   1e-6

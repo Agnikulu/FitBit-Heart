@@ -1,0 +1,33 @@
+# configs/global.yaml  – SHARED DEFAULTS
+seed: 42
+device: "cuda"        # use "cpu" to force CPU
+
+# ------------------------------------------------------------------
+# DATA PATHS  (edit once here)
+data:
+  biosignal_dir: "data/Personalized AI Data/Biosignal"
+  label_root:    "data/Personalized AI Data/Label"
+  lifesnaps_csv: "data/lifesnaps.csv"
+
+# ------------------------------------------------------------------
+# GLOBAL FLAGS
+autoupdate_readme: true          # master switch for README sync helper
+results_root:      "results"    # where experiments write outputs
+ssl_ckpt:          "${results_root}/saved_models/ssl_backbone.pth"
+
+# ------------------------------------------------------------------
+# UNIVERSAL WINDOWING
+window:
+  size:            6   # hours per chunk
+  input_windows:   2   # history windows
+  predict_windows: 1   # future windows
+
+# ------------------------------------------------------------------
+# BACKBONE HYPER‑PARAMS (shared)
+model:
+  embed_dim:    256
+  cnn_channels: [32, 64]
+  rnn_hidden:   128
+  rnn_layers:   2
+  attn_heads:   1
+  dropout:      0.3
