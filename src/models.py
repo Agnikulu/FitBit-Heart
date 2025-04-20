@@ -1,12 +1,13 @@
 # src/models.py
-
 import torch
 import torch.nn as nn
 
 class SSLForecastingModel(nn.Module):
     """
-    A multi-step forecasting model with self-attention over past + future windows.
-    Current‑windows (BPM/Steps) are concatenated, not averaged.
+    Self‑supervised multi‑step forecaster with *cross‑modal* current‑window
+    tokens (no self‑leakage):
+        • Path‑BPM  : past‑summary  + current‑STEPS  tokens  → predict BPM
+        • Path‑Steps: past‑summary  + current‑BPM    tokens  → predict Steps
     """
     def __init__(self,
                  window_size: int,
@@ -16,120 +17,145 @@ class SSLForecastingModel(nn.Module):
         super().__init__()
         self.window_size     = window_size
         self.predict_windows = predict_windows
+        self.embed_dim       = 256
 
-        # --- BPM branch ---
-        self.bpm_cnn = nn.Sequential(
-            nn.Conv1d(1, 32, 3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(32, 64, 3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.bpm_rnn = nn.GRU(64, 128, num_layers=2, batch_first=True)
+        # ── per‑modality CNN+GRU encoders for the *past* windows ──────────
+        def make_branch():
+            return nn.Sequential(
+                nn.Conv1d(1, 32, 3, padding=1),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Conv1d(32, 64, 3, padding=1),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
 
-        # --- Steps branch ---
-        self.steps_cnn = nn.Sequential(
-            nn.Conv1d(1, 32, 3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(32, 64, 3, padding=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+        self.bpm_cnn   = make_branch()
+        self.steps_cnn = make_branch()
+        self.bpm_rnn   = nn.GRU(64, 128, num_layers=2, batch_first=True)
         self.steps_rnn = nn.GRU(64, 128, num_layers=2, batch_first=True)
 
-        # current window embeddings → 16d each
+        # ── single‑modality aggregators for the *current* window ──────────
         self.agg_current_bpm   = nn.Sequential(
-            nn.Linear(window_size, 16),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Linear(window_size, 16), nn.ReLU(), nn.Dropout(dropout)
         )
         self.agg_current_steps = nn.Sequential(
-            nn.Linear(window_size, 16),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Linear(window_size, 16), nn.ReLU(), nn.Dropout(dropout)
         )
-        # concatenate (16+16=32) → project to 256d tokens
-        self.curr_proj = nn.Linear(16*2, 256)
+        # shared projection 16 → 256
+        self.curr_proj = nn.Linear(16, self.embed_dim)
 
-        # positional embeddings for [past + predict_windows]
-        self.pos_emb = nn.Embedding(predict_windows + 1, 256)
+        # positional embeddings (P+1 because we prepend the past summary)
+        self.pos_emb = nn.Embedding(predict_windows + 1, self.embed_dim)
 
-        # self-attention over tokens
-        self.attn    = nn.MultiheadAttention(embed_dim=256,
-                                             num_heads=attn_heads,
-                                             batch_first=True)
-        self.attn_ln = nn.LayerNorm(256)
+        # two separate attention‑>FFN stacks (one per prediction path)
+        def make_attn_block():
+            attn = nn.MultiheadAttention(self.embed_dim, attn_heads,
+                                         batch_first=True)
+            ln1  = nn.LayerNorm(self.embed_dim)
+            ffn  = nn.Sequential(
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.Dropout(dropout),
+            )
+            ln2  = nn.LayerNorm(self.embed_dim)
+            return attn, ln1, ffn, ln2
 
-        # feed-forward residual block
-        self.ffn    = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 256),
-            nn.Dropout(dropout),
-        )
-        self.ffn_ln = nn.LayerNorm(256)
+        (self.attn_bpm,
+         self.ln1_bpm,
+         self.ffn_bpm,
+         self.ln2_bpm)   = make_attn_block()
 
-        # final fusion heads
-        self.fusion_bpm   = nn.Linear(256, window_size)
-        self.fusion_steps = nn.Linear(256, window_size)
+        (self.attn_steps,
+         self.ln1_steps,
+         self.ffn_steps,
+         self.ln2_steps) = make_attn_block()
 
+        # modality‑specific decoders
+        self.fusion_bpm   = nn.Linear(self.embed_dim, window_size)
+        self.fusion_steps = nn.Linear(self.embed_dim, window_size)
+
+    # ──────────────────────────────────────────────────────────────────────
+    def _extract_past_summary(self, bpm_in, steps_in):
+        """CNN+GRU → last hidden → concatenate → 256‑d past summary"""
+        B = bpm_in.size(0)
+
+        def feat(x, cnn, rnn):
+            v = x.view(B, -1).unsqueeze(1)        # [B,1,L]
+            v = cnn(v).permute(0, 2, 1)           # [B,L,64]
+            h, _ = rnn(v)
+            return h[:, -1, :]                    # [B,128]
+
+        h_bpm   = feat(bpm_in,   self.bpm_cnn,   self.bpm_rnn)
+        h_steps = feat(steps_in, self.steps_cnn, self.steps_rnn)
+        return torch.cat([h_bpm, h_steps], dim=1)  # [B,256]
+
+    def _build_tokens(self, features, P):
+        """features: list length P of 16‑d tensors → [B,P,256]"""
+        tokens = [self.curr_proj(f) for f in features]         # each [B,256]
+        return torch.stack(tokens, dim=1)                      # [B,P,256]
+
+    # ------------------------------------------------------------------ #
     def forward(self, bpm_in, steps_in, cur_bpm, cur_steps):
-        B, P = bpm_in.size(0), self.predict_windows
+        """
+        Shapes
+        -------
+        bpm_in, steps_in : [B, input_windows, W]
+        cur_bpm,cur_steps: [B, P, W]  (P = predict_windows, W = window_size)
+        """
+        B, P, W = bpm_in.size(0), self.predict_windows, self.window_size
 
-        # extract past summary
-        def extract(x, cnn, rnn):
-            v = x.view(B, -1).unsqueeze(1)   # [B,1,past_len]
-            v = cnn(v).permute(0,2,1)        # [B,past_len,64]
-            h, _ = rnn(v)                    # [B,past_len,128]
-            return h[:, -1, :]               # [B,128]
+        past_summary = self._extract_past_summary(bpm_in, steps_in)  # [B,256]
 
-        h_bpm   = extract(bpm_in,   self.bpm_cnn,   self.bpm_rnn)
-        h_steps = extract(steps_in, self.steps_cnn, self.steps_rnn)
-        past    = torch.cat([h_bpm, h_steps], dim=1)  # [B,256]
+        # ── build cross‑modal token sequences ───────────────────────────
+        # Path‑BPM  sees current‑steps only
+        feats_bpm = [self.agg_current_steps(cur_steps[:, w, :]) for w in range(P)]
+        tok_bpm   = self._build_tokens(feats_bpm, P)                # [B,P,256]
 
-        # build token sequence: [past, cw1, cw2, …]
-        tokens = [past]
-        for w in range(P):
-            cb = self.agg_current_bpm(cur_bpm[:,w,:])    # [B,16]
-            cs = self.agg_current_steps(cur_steps[:,w,:])# [B,16]
-            cw = torch.cat([cb, cs], dim=1)              # [B,32]
-            tokens.append(self.curr_proj(cw))            # [B,256]
-        tokens = torch.stack(tokens, dim=1)              # [B,P+1,256]
+        # Path‑Steps sees current‑bpm only
+        feats_steps = [self.agg_current_bpm(cur_bpm[:, w, :]) for w in range(P)]
+        tok_steps   = self._build_tokens(feats_steps, P)            # [B,P,256]
 
-        # add positional embeddings
-        idx = torch.arange(P+1, device=tokens.device)
-        tokens = tokens + self.pos_emb(idx)[None,:,:]
+        # prepend past summary & add positional enc.
+        def add_pos(tokens):
+            seq = torch.cat([past_summary.unsqueeze(1), tokens], dim=1)  # [B,P+1,256]
+            idx = torch.arange(P + 1, device=seq.device)
+            return seq + self.pos_emb(idx)[None, :, :]
+        seq_bpm   = add_pos(tok_bpm)
+        seq_steps = add_pos(tok_steps)
 
-        # attention + residual + norm
-        attn_out, _ = self.attn(tokens, tokens, tokens)
-        res1 = self.attn_ln(tokens + attn_out)
+        # ── transformer block (per path) ────────────────────────────────
+        # BPM path
+        attn_out, _ = self.attn_bpm(seq_bpm, seq_bpm, seq_bpm)
+        res1 = self.ln1_bpm(seq_bpm + attn_out)
+        ffn_out = self.ffn_bpm(res1)
+        res_bpm = self.ln2_bpm(res1 + ffn_out)
 
-        # feed-forward + residual + norm
-        ffn_out = self.ffn(res1)
-        res2    = self.ffn_ln(res1 + ffn_out)
+        # Steps path
+        attn_out_s, _ = self.attn_steps(seq_steps, seq_steps, seq_steps)
+        res1_s = self.ln1_steps(seq_steps + attn_out_s)
+        ffn_out_s = self.ffn_steps(res1_s)
+        res_steps = self.ln2_steps(res1_s + ffn_out_s)
 
-        # decode each future token
-        fused     = res2[:,1:,:]               # [B,P,256]
-        out_bpm   = self.fusion_bpm(fused)     # [B,P,window_size]
-        out_steps = self.fusion_steps(fused)   # [B,P,window_size]
+        # ── decode future tokens (drop index 0 = past summary) ──────────
+        out_bpm   = self.fusion_bpm(res_bpm[:, 1:, :])    # [B,P,W]
+        out_steps = self.fusion_steps(res_steps[:, 1:, :])# [B,P,W]
         return out_bpm, out_steps
 
 
 class PersonalizedForecastingModel(SSLForecastingModel):
-    """Same as SSLForecastingModel; used for fine‑tuning."""
+    """Same architecture as SSLForecastingModel; used for fine‑tuning."""
     pass
 
 
 class DrugClassifier(nn.Module):
     """
-    Binary classifier re‑using the same CNN+RNN extractors.
+    Binary classifier that re‑uses the CNN+GRU feature extractors
+    (kept identical), followed by a small MLP head.
     """
     def __init__(self, window_size=6, dropout=0.3):
         super().__init__()
@@ -148,22 +174,21 @@ class DrugClassifier(nn.Module):
             )
 
         self.bpm_cnn   = make_branch()
-        self.bpm_rnn   = nn.GRU(64, 128, num_layers=2, batch_first=True)
         self.steps_cnn = make_branch()
+        self.bpm_rnn   = nn.GRU(64, 128, num_layers=2, batch_first=True)
         self.steps_rnn = nn.GRU(64, 128, num_layers=2, batch_first=True)
 
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 1),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 1)
         )
 
     def forward(self, bpm_in, steps_in):
         B = bpm_in.size(0)
+
         def feat(x, cnn, rnn):
             v = x.view(B, -1).unsqueeze(1)
-            v = cnn(v).permute(0,2,1)
+            v = cnn(v).permute(0, 2, 1)
             h, _ = rnn(v)
             return h[:, -1, :]
 

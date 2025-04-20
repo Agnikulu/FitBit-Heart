@@ -36,21 +36,25 @@ class CraveDataset(Dataset):
         )
 
 
-def make_samples(df_user, label_col, win_size):
+def make_samples(df_user, label_col, win_size, *, stride):
     """
-    Create sliding windows of size win_size with stride=1.
-    Label=1 if any hour in window has a positive event.
+    Sliding / non‑overlapping window builder.
+
+    Parameters
+    ----------
+    stride : int
+        • stride == win_size → non‑overlapping  
+        • stride  < win_size → overlapping
     """
-    out = []
-    df_user = df_user.sort_values("datetime").reset_index(drop=True)
+    out, df_user = [], df_user.sort_values("datetime").reset_index(drop=True)
     n = len(df_user)
-    for i in range(0, n - win_size + 1):
-        chunk = df_user.iloc[i : i + win_size]
+    for i in range(0, n - win_size + 1, stride):
+        chunk = df_user.iloc[i:i + win_size]
         out.append({
             "id":    chunk["id"].iat[0],
-            "bpm":   chunk.get("bpm_scaled", chunk["bpm"]).values,
+            "bpm":   chunk.get("bpm_scaled",   chunk["bpm"]).values,
             "steps": chunk.get("steps_scaled", chunk["steps"]).values,
-            "label": int(chunk[label_col].max() == 1)
+            "label": int(chunk[label_col].max() == 1),
         })
     return out
 
@@ -98,8 +102,8 @@ def main():
 
         for lbl in lbl_cols:
             # 4a) create windows only after splitting
-            samples_tv   = make_samples(df_train_val, lbl, cfg.window.size)
-            samples_test = make_samples(df_test,      lbl, cfg.window.size)
+            samples_tv   = make_samples(df_train_val, lbl, cfg.window.size, stride=1)
+            samples_test = make_samples(df_test, lbl, cfg.window.size, stride=cfg.window.size)
 
             # catch empty test-window case
             if len(samples_test) == 0:
@@ -121,11 +125,12 @@ def main():
                 stratify=y_tv,
                 random_state=cfg.seed
             )
+
             idx_train, idx_val = train_test_split(
-                idx_tv,
-                test_size=test_frac / (1 - test_frac),
-                stratify=y_tv[idx_tv],
-                random_state=cfg.seed
+                np.arange(len(samples_tv)),
+                test_size=0.176,          
+                stratify=y_tv,
+                random_state=cfg.seed,
             )
 
             def mk_loader(samples, indices, shuffle):
@@ -160,7 +165,7 @@ def main():
 
             # 7) Freeze all but classifier & LSTM
             for name, param in model.named_parameters():
-                param.requires_grad = ("classifier" in name or "lstm" in name)
+                param.requires_grad = ("classifier" in name or "rnn" in name)
 
             # 8) Compute class‐weight from train only
             train_labels = np.array([samples_tv[i]["label"] for i in idx_train])
