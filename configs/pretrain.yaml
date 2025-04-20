@@ -1,16 +1,31 @@
-defaults: [paths]
+# configs/pretrain.yaml
 
 seed: 42
 device: "cuda"
+
+data:
+  lifesnaps_csv: "data/lifesnaps.csv"
+
+results_root: "results"
+ssl_ckpt:     "results/saved_models/ssl_backbone.pth"
 
 window:
   size:            6
   input_windows:   2
   predict_windows: 1
 
+model:
+  attn_heads: 1
+  dropout:    0.3
+
 pretrain:
-  batch_size:   128
-  num_epochs:   100
-  lr:           1.0e-3
-  patience:     15
-  scheduler: {step_size: 20, gamma: 0.1}
+  batch_size:    128
+  num_epochs:    100
+  lr:            1e-3
+  weight_decay:  1e-5
+  patience:      20
+  scheduler:
+    type:      plateau
+    patience:  10
+    factor:    0.5
+    min_lr:    1e-6

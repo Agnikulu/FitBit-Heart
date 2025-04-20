@@ -1,158 +1,263 @@
-"""
-Binary classification (drug/craving) with per‑user models.
-"""
-import os, random, warnings, numpy as np, pandas as pd, torch, matplotlib.pyplot as plt
+# src/test.py
+
+import os
+import random
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_auc_score
 from torch.utils.data import Dataset, DataLoader, RandomSampler
+
 from src.config import load_config
 import src.utils as U
-from src.models import DrugClassifier, partially_unfreeze_backbone
+from src.models import DrugClassifier
 
 warnings.filterwarnings("ignore")
 
-class CraveDataset(Dataset):
-    def __init__(self, S): self.S=S
-    def __len__(self):     return len(self.S)
-    def __getitem__(self,i):
-        s=self.S[i]
-        return (torch.tensor(s["bpm"],dtype=torch.float32),
-                torch.tensor(s["steps"],dtype=torch.float32),
-                s["id"],
-                torch.tensor(s["label"],dtype=torch.float32))
 
-def make_samples(df_u, lbl_col, win=6):
-    lst=[]
-    df_u = df_u.sort_values("datetime").reset_index(drop=True)
-    for i in range(0, len(df_u), win):
-        chunk = df_u.iloc[i:i+win]
-        if len(chunk)<win: break
-        lst.append(dict(
-            id    = chunk["id"].iat[0],
-            bpm   = chunk.get("bpm_scaled",chunk["bpm"]).values,
-            steps = chunk.get("steps_scaled",chunk["steps"]).values,
-            label = int(chunk[lbl_col].max()==1)
-        ))
-    return lst
+class CraveDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        return (
+            torch.tensor(s["bpm"],   dtype=torch.float32),
+            torch.tensor(s["steps"], dtype=torch.float32),
+            s["id"],
+            torch.tensor(s["label"], dtype=torch.float32),
+        )
+
+
+def make_samples(df_user, label_col, win_size):
+    out = []
+    df_user = df_user.sort_values("datetime").reset_index(drop=True)
+    for i in range(0, len(df_user), win_size):
+        chunk = df_user.iloc[i : i + win_size]
+        if len(chunk) < win_size:
+            break
+        out.append({
+            "id":    chunk["id"].iat[0],
+            "bpm":   chunk.get("bpm_scaled", chunk["bpm"]).values,
+            "steps": chunk.get("steps_scaled", chunk["steps"]).values,
+            "label": int(chunk[label_col].max() == 1)
+        })
+    return out
+
 
 def main():
     cfg = load_config()
-    torch.manual_seed(cfg.seed); random.seed(cfg.seed); np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
+    # 1) Load & merge sensor + label data
     df_sensor = U.load_sensor_data(cfg.data.biosignal_dir)
-    df_labels = U.load_label_data(cfg.data.label_root)
-    df_hour   = U.pivot_label_data(df_labels)
+    df_label  = U.load_label_data(cfg.data.label_root)
+    df_hour   = U.pivot_label_data(df_label)
     df        = U.merge_sensors_with_labels(df_sensor, df_hour)
     df        = df.groupby("id").apply(U.scale_per_user).reset_index(drop=True)
-    lbl_cols  = [c for c in df.columns if c.endswith("_label")]
-    if not lbl_cols: raise SystemExit("No label columns found")
 
-    res_root  = os.path.join(cfg.results_root,"test"); os.makedirs(res_root,exist_ok=True)
-    all_res   = []
+    # 2) Which label columns do we have?
+    lbl_cols = [c for c in df.columns if c.endswith("_label")]
+    if not lbl_cols:
+        raise SystemExit("No label columns found – aborting")
+
+    # 3) Output dir
+    res_root = os.path.join(cfg.results_root, "test")
+    os.makedirs(res_root, exist_ok=True)
+    all_results = []
 
     for uid in sorted(df["id"].unique()):
-        usr_dir = os.path.join(res_root,f"user_{uid}"); os.makedirs(usr_dir, exist_ok=True)
-        df_u = df[df["id"]==uid]
-        if len(df_u) < 2*cfg.window_size: continue
+        user_dir = os.path.join(res_root, f"user_{uid}")
+        os.makedirs(user_dir, exist_ok=True)
+        df_u = df[df["id"] == uid]
+        if len(df_u) < 2 * cfg.window.size:
+            print(f"[User {uid}] Insufficient data – skipping")
+            continue
 
         for lbl in lbl_cols:
-            S = make_samples(df_u,lbl,cfg.window_size)
-            if len(S)<15: continue
-            y = np.array([s["label"] for s in S])
-            if y.sum()<2 or (len(y)-y.sum())<2: continue
+            samples = make_samples(df_u, lbl, cfg.window.size)
+            if len(samples) < 15:
+                continue
+            y = np.array([s["label"] for s in samples])
+            if y.sum() < 2 or (len(y)-y.sum()) < 2:
+                continue
 
-            idx = np.arange(len(S))
-            idx_t, idx_te = train_test_split(idx,test_size=.15,stratify=y,random_state=42)
-            idx_tr, idx_vl = train_test_split(
-                idx_t,test_size=.15/.85,stratify=y[idx_t],random_state=42)
+            # train/val/test split
+            idx = np.arange(len(samples))
+            idx_tv, idx_test = train_test_split(
+                idx, test_size=0.15, stratify=y, random_state=cfg.seed
+            )
+            val_frac = 0.15 / 0.85
+            idx_train, idx_val = train_test_split(
+                idx_tv, test_size=val_frac, stratify=y[idx_tv], random_state=cfg.seed
+            )
 
-            mk_loader = lambda I,sh=True: DataLoader(
-                CraveDataset([S[i] for i in I]),
-                batch_size=cfg.test.batch_size,
-                sampler=RandomSampler(I) if sh else None)
-            tr_loader, vl_loader = mk_loader(idx_tr), mk_loader(idx_vl,False)
-            te_loader = mk_loader(idx_te,False)
+            def mk_loader(idxs, shuffle):
+                ds = CraveDataset([samples[i] for i in idxs])
+                return DataLoader(
+                    ds,
+                    batch_size = cfg.test.batch_size,
+                    sampler    = RandomSampler(ds) if shuffle else None
+                )
 
-            model = DrugClassifier(window_size=cfg.window_size).to(device)
-            ckpt  = os.path.join(cfg.results_root,"train",f"user_{uid}","personalized_ssl.pt")
+            train_loader = mk_loader(idx_train, True)
+            val_loader   = mk_loader(idx_val,   False)
+            test_loader  = mk_loader(idx_test,  False)
+
+            # 4) build model, load personalized SSL weights
+            model = DrugClassifier(window_size=cfg.window.size).to(device)
+            ckpt  = os.path.join(cfg.results_root, "train", f"user_{uid}", "personalized_ssl.pt")
             if os.path.isfile(ckpt):
-                sd = torch.load(ckpt,map_location="cpu"); ms=model.state_dict()
-                ms.update({k:v for k,v in sd.items() if k in ms and v.shape==ms[k].shape})
-                model.load_state_dict(ms)
-            partially_unfreeze_backbone(model,cfg.test.unfreeze_ratio)
+                ssl_sd    = torch.load(ckpt, map_location="cpu")
+                model_sd  = model.state_dict()
+                matched   = {
+                    k:v
+                    for k,v in ssl_sd.items()
+                    if k in model_sd and v.shape == model_sd[k].shape
+                }
+                model_sd.update(matched)
+                model.load_state_dict(model_sd)
+                print(f"[U{uid}] Transferred {len(matched)}/{len(model_sd)} layers")
+            else:
+                print(f"[U{uid}] No SSL checkpoint – random init")
 
-            crit = torch.nn.BCEWithLogitsLoss()
-            opt  = torch.optim.Adam(filter(lambda p:p.requires_grad,model.parameters()),
-                                    lr=cfg.test.lr)
-            sch  = torch.optim.lr_scheduler.StepLR(
-                opt,step_size=cfg.test.scheduler.step_size,
-                gamma=cfg.test.scheduler.gamma)
+            # 5) FREEZE backbone, train only classifier head
+            for name,param in model.named_parameters():
+                if name.startswith("classifier"):
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
 
-            best_val,no_imp = float("inf"),0
-            lbl_dir = os.path.join(usr_dir,lbl); os.makedirs(lbl_dir,exist_ok=True)
-            best_ck = os.path.join(lbl_dir,"best.pt")
+            criterion = torch.nn.BCEWithLogitsLoss()
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=cfg.test.lr
+            )
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                patience=cfg.test.scheduler.patience,
+                factor=cfg.test.scheduler.factor,
+                min_lr=cfg.test.scheduler.min_lr,
+                verbose=True
+            )
 
-            for ep in range(1,cfg.test.num_epochs+1):
-                if no_imp>=cfg.test.patience: break
-                # train
-                model.train(); tr=0.
-                for bpm,stp,_id,tgt in tr_loader:
-                    bpm,stp,tgt = bpm.to(device),stp.to(device),tgt.to(device)
-                    opt.zero_grad(); loss=crit(model(bpm,stp),tgt)
-                    loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
-                    opt.step(); tr+=loss.item()
-                tr/=len(tr_loader); sch.step()
-                # val
-                model.eval(); vl=0.; preds=[]; gts=[]
+            # 6) train/val loop
+            best_val, no_imp = float("inf"), 0
+            lbl_dir = os.path.join(user_dir, lbl)
+            os.makedirs(lbl_dir, exist_ok=True)
+            best_ck = os.path.join(lbl_dir, "best.pt")
+
+            for ep in range(1, cfg.test.num_epochs+1):
+                if no_imp >= cfg.test.patience:
+                    break
+
+                # — train —
+                model.train()
+                trl = 0.0
+                for bpm,steps,_id,tgt in train_loader:
+                    bpm,steps,tgt = bpm.to(device), steps.to(device), tgt.to(device)
+                    optimizer.zero_grad()
+                    logits = model(bpm, steps)
+                    loss   = criterion(logits, tgt)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                    optimizer.step()
+                    trl += loss.item()
+                trl /= len(train_loader)
+                scheduler.step(trl)
+
+                # — validate —
+                model.eval()
+                vall, preds, gts = 0.0, [], []
                 with torch.no_grad():
-                    for bpm,stp,_id,tgt in vl_loader:
-                        logit=model(bpm.to(device),stp.to(device))
-                        vl+=crit(logit,tgt.to(device)).item()
-                        preds += torch.sigmoid(logit).tolist(); gts += tgt.tolist()
-                vl/=len(vl_loader); acc=( (np.array(preds)>=.5)==np.array(gts) ).mean()*100
-                print(f"[U{uid}|{lbl}] ep{ep:02d} tr{tr:.4f} vl{vl:.4f} acc{acc:5.1f}%")
-                if vl<best_val:
-                    best_val,no_imp=vl,0; torch.save(model.state_dict(),best_ck)
-                else: no_imp+=1
-            if not os.path.isfile(best_ck): continue
-            model.load_state_dict(torch.load(best_ck,map_location=device))
+                    for bpm,steps,_id,tgt in val_loader:
+                        bpm,steps,tgt = bpm.to(device), steps.to(device), tgt.to(device)
+                        logits = model(bpm, steps)
+                        vall += criterion(logits, tgt).item()
+                        preds.extend(torch.sigmoid(logits).cpu().tolist())
+                        gts.extend(tgt.cpu().tolist())
+                vall /= len(val_loader)
+                acc_val = ((np.array(preds)>=0.5) == np.array(gts)).mean()*100
+                print(f"[U{uid}|{lbl}] ep{ep:02d} tr{trl:.4f} vl{vall:.4f} acc{acc_val:5.1f}%")
 
-            # threshold on val
-            model.eval(); pv,yv=[],[]
-            with torch.no_grad():
-                for bpm,stp,_id,tgt in vl_loader:
-                    pv += torch.sigmoid(model(bpm.to(device),stp.to(device))).tolist()
-                    yv += tgt.tolist()
-            pv,yv = np.array(pv),np.array(yv)
-            thr = max(np.linspace(0,1,101), key=lambda t:((pv>=t)==yv).mean())
+                if vall < best_val:
+                    best_val, no_imp = vall, 0
+                    torch.save(model.state_dict(), best_ck)
+                else:
+                    no_imp += 1
 
-            # test
-            pt,yt=[],[]
+            if not os.path.isfile(best_ck):
+                continue
+            model.load_state_dict(torch.load(best_ck, map_location=device))
+
+            # 7) pick threshold on validation
+            pv,yv = [],[]
+            model.eval()
             with torch.no_grad():
-                for bpm,stp,_id,tgt in te_loader:
-                    pt += torch.sigmoid(model(bpm.to(device),stp.to(device))).tolist()
-                    yt += tgt.tolist()
-            pt,yt = np.array(pt),np.array(yt)
-            auc = np.nan if len(np.unique(yt))==1 else roc_auc_score(yt,pt)
-            pred=(pt>=thr).astype(int); acc=(pred==yt).mean()*100
+                for bpm,steps,_id,tgt in val_loader:
+                    logits = model(bpm.to(device), steps.to(device))
+                    pv.extend(torch.sigmoid(logits).cpu().tolist())
+                    yv.extend(tgt.cpu().tolist())
+            pv,yv = np.array(pv), np.array(yv)
+            best_thr = max(np.linspace(0,1,101), key=lambda t: ((pv>=t)==yv).mean())
+
+            # 8) final test evaluation
+            pt,yt = [],[]
+            with torch.no_grad():
+                for bpm,steps,_id,tgt in test_loader:
+                    logits = model(bpm.to(device), steps.to(device))
+                    pt.extend(torch.sigmoid(logits).cpu().tolist())
+                    yt.extend(tgt.cpu().tolist())
+            pt,yt = np.array(pt), np.array(yt)
+            auc   = np.nan if len(np.unique(yt))==1 else roc_auc_score(yt,pt)
+            pred  = (pt>=best_thr).astype(int)
+            acc   = (pred==yt).mean()*100
             tn,fp,fn,tp = confusion_matrix(yt,pred,labels=[0,1]).ravel()
-            print(f"[U{uid}|{lbl}] TEST thr={thr:.2f} acc={acc:.2f}% auc={auc:.3f}")
 
-            # plot confusion
-            plt.figure(figsize=(3,3)); plt.imshow([[tn,fp],[fn,tp]],cmap="Blues")
+            print(f"[U{uid}|{lbl}] TEST thr={best_thr:.2f} acc={acc:.2f}% auc={auc:.3f}")
+
+            # plot & save confusion matrix
+            plt.figure(figsize=(3,3))
+            plt.imshow([[tn,fp],[fn,tp]], cmap="Blues")
             for i,v in enumerate([tn,fp,fn,tp]):
-                plt.text(i%2,i//2,str(v),ha="center",va="center",
+                plt.text(i%2, i//2, str(v),
+                         ha="center", va="center",
                          color="white" if v>max(tn,fp,fn,tp)/2 else "black")
-            plt.title(f"U{uid} {lbl}\nth={thr:.2f} acc={acc:.1f}%")
-            plt.tight_layout(); plt.savefig(os.path.join(lbl_dir,f"cm_{thr:.2f}.png")); plt.close()
+            plt.title(f"U{uid} {lbl}\nth={best_thr:.2f} acc={acc:.1f}%")
+            plt.tight_layout()
+            plt.savefig(os.path.join(lbl_dir, f"cm_{best_thr:.2f}.png"))
+            plt.close()
 
-            all_res.append(dict(user_id=uid,label_col=lbl,pos=int(yt.sum()),
-                                neg=int(len(yt)-yt.sum()),thr=thr,auc=auc,acc=acc,
-                                tn=tn,fp=fp,fn=fn,tp=tp))
-    if all_res:
-        pd.DataFrame(all_res).to_csv(
-            os.path.join(res_root,"classification_summary.csv"),index=False)
+            all_results.append({
+                "user_id":   uid,
+                "label_col": lbl,
+                "pos":       int(yt.sum()),
+                "neg":       int(len(yt)-yt.sum()),
+                "thr":       best_thr,
+                "auc":       auc,
+                "acc":       acc,
+                "tn":        tn,
+                "fp":        fp,
+                "fn":        fn,
+                "tp":        tp
+            })
+
+    if all_results:
+        pd.DataFrame(all_results).to_csv(
+            os.path.join(res_root, "classification_summary.csv"),
+            index=False
+        )
+
 
 if __name__ == "__main__":
     main()

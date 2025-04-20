@@ -1,44 +1,47 @@
-"""
-YAML Loader.
+# src/config.py
 
-Usage examples
---------------
-python -m src.pretrain --config configs/pretrain.yaml device=cpu
-python -m src.train    --config configs/train.yaml   train.lr=5e-4
-"""
-from __future__ import annotations
-import sys, pathlib, yaml
-from types import SimpleNamespace
+import argparse
+from pathlib import Path
 
-def _to_ns(d: dict) -> SimpleNamespace:
-    ns = SimpleNamespace()
-    for k, v in d.items():
-        setattr(ns, k, _to_ns(v) if isinstance(v, dict) else v)
-    return ns
+from omegaconf import OmegaConf, DictConfig
 
-def _cast(s: str):
-    if s.lower() in {"true","false"}: return s.lower()=="true"
-    try: return int(s)
-    except ValueError:
-        try: return float(s)
-        except ValueError: return s
 
-def _set(d: dict, dotted: str, v):
-    ks=dotted.split(".")
-    for k in ks[:-1]: d=d.setdefault(k,{})
-    d[ks[-1]]=v
+def load_config() -> DictConfig:
+    """
+    Load a YAML config via `--config path/to.yaml` plus any number of
+    dotlist overrides (like Hydra).
 
-def _load(p: pathlib.Path):
-    with p.open() as f: cfg=yaml.safe_load(f) or {}
-    for inc in cfg.pop("defaults", []):
-        parent=_load(p.parent/f"{inc}.yaml"); parent.update(cfg); cfg=parent
+    Usage:
+      python -m src.pretrain --config configs/pretrain.yaml \
+            model.attn_heads=2 pretrain.lr=5e-4
+
+    Returns:
+      OmegaConf DictConfig with interpolation resolved.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "-c", "--config",
+        required=True,
+        help="path to your YAML config file"
+    )
+    # take the rest as overrides
+    args, overrides = parser.parse_known_args()
+
+    cfg_path = Path(args.config)
+    if not cfg_path.is_file():
+        parser.error(f"Config file not found: {cfg_path}")
+
+    # 1) Load the main YAML
+    cfg: DictConfig = OmegaConf.load(str(cfg_path))
+
+    # 2) Apply CLI overrides (dotlist)
+    if overrides:
+        dotlist = [ov for ov in overrides if not ov.startswith("-")]
+        if dotlist:
+            oc_override = OmegaConf.from_dotlist(dotlist)
+            cfg = OmegaConf.merge(cfg, oc_override)
+
+    # 3) Resolve interpolations
+    OmegaConf.resolve(cfg)
+
     return cfg
-
-def load_config():
-    argv=sys.argv[1:]
-    if len(argv)<2 or argv[0] not in {"-c","--config"}:
-        raise SystemExit("Usage: ... --config cfg.yaml [key=value ...]")
-    cfg=_load(pathlib.Path(argv[1]))
-    for ov in argv[2:]:
-        k,v=ov.split("=",1); _set(cfg,k,_cast(v))
-    return _to_ns(cfg)
