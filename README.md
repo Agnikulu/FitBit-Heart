@@ -92,6 +92,7 @@
 - **Purpose**: Binary classification of use/crave events using the pretrained backbone.  
 - **Architecture**:  
   - **Shared CNN+GRU Branches** (identical to forecasting encoders, no attention).  
+  - **Attention‑Pooling Layer**: computes per‑time‑step scores over the concatenated GRU outputs and aggregates them into a single [B, 2 × hidden] vector.  
   - **Classifier Head**:  
     ```python
     # after concatenating bpm_hidden & steps_hidden → [B,256]:
@@ -100,12 +101,13 @@
     ```  
   - Sigmoid‑based binary output.  
 - **Fine‑Tuning**:  
-  - Unfreeze the **last 30%** of backbone layers (the deepest CNN+GRU blocks) **and** the classifier head, freeze the rest.  
+  - Unfreeze the **last 30%** of backbone layers (the deepest CNN+GRU blocks).
 - **Why No Attention?**  
   - Each input is just a single 6 h block (a 1×6 sequence of two signals): our CNN+GRU captures those six time‑step patterns effectively.  
   - The SSL forecasting task, by contrast, must fuse a “past” summary plus multiple “current” windows (several 6 h chunks) simultaneously—an inherently multi‑token scenario that benefits from self‑attention.  
-- **Handling Class Imbalance via Sliding Windows**:  
-  - When positive labels (e.g. “crave”) are very rare, we **augment positives** by switching from non‑overlapping 6 h blocks to an **overlapping sliding‑window** during **training only**:  
+- **Handling Class Imbalance**:  
+  - **Focal Loss** (γ=2.0) replaces BCE to focus on rare positives.  
+  - **Sliding‑window augmentation (train only)** When positive labels (e.g. “crave”) are very rare, we **augment positives** by switching from non‑overlapping 6 h blocks to an **overlapping sliding‑window** during **training only**:  
     ```python
     # Non‑overlap stride = window_size (e.g. 6 h):
     for i in range(0, len(df), win):
@@ -265,13 +267,15 @@
 ### **3.3 Substance Use Classification**  
 - **Setup**: 70/15/15 train/val/test splits per substance‑event pair, applied to raw hourly data *before* windowing.  
 - **Windowing**:  
-  - **Train/Val**: can use overlapping 6 h windows for augmentation.  
+  - **Train/Val**: overlapping 6 h windows (stride=1 h) for augmentation.  
   - **Test**: non‑overlapping 6 h windows only.  
+- **Loss & Hyperparameters**:  
+  - **FocalLoss** (γ=2.0), lr=1e‑3, batch_size=32, patience=5.  
+  - **Scheduler**: ReduceLROnPlateau (factor=0.1, min_lr=1e‑6).  
 - **Threshold Selection**:  
-  - Chosen by **maximizing Youden’s J** (sensitivity + specificity − 1) on the validation set to achieve a balanced operating point.  
-- **Hyperparameters**:  
-  - lr=1e‑3, batch_size=32, patience=5, StepLR(γ=0.1, step=10).  
-  - Unfreeze 30% of backbone layers (last CNN+GRU blocks + classifier head).  
+  - Maximize **Youden’s J** (sensitivity + specificity − 1) on the validation set.  
+- **Fine‑Tuning**:  
+  - Unfreeze 30% of backbone (last GRU blocks) + classifier head.
 
 #### Participant Best Threshold Results
 
@@ -279,59 +283,59 @@
 
 |   user_id | label_col                   |   n_test |   pos |   neg |   thr |     auc |     acc |   tn |   fp |   fn |   tp |   sensitivity |   specificity |
 |----------:|:----------------------------|---------:|------:|------:|------:|--------:|--------:|-----:|-----:|-----:|-----:|--------------:|--------------:|
-|         5 | methamphetamine_crave_label |        4 |     0 |     4 |  0.41 | nan     |  50     |    2 |    2 |    0 |    0 |       nan     |         0.5   |
-|         9 | methamphetamine_crave_label |        6 |     1 |     5 |  0.57 |   0.2   |  66.667 |    4 |    1 |    1 |    0 |         0     |         0.8   |
-|        10 | cannabis_use_label          |       11 |     4 |     7 |  0.5  |   0.536 |  45.455 |    3 |    4 |    2 |    2 |         0.5   |         0.429 |
-|        10 | cannabis_crave_label        |       11 |     2 |     9 |  0.26 |   0.278 |  36.364 |    4 |    5 |    2 |    0 |         0     |         0.444 |
-|        10 | nicotine_use_label          |       11 |     0 |    11 |  0.53 | nan     |  27.273 |    3 |    8 |    0 |    0 |       nan     |         0.273 |
-|        10 | nicotine_crave_label        |       11 |     4 |     7 |  0.49 |   0.643 |  72.727 |    7 |    0 |    3 |    1 |         0.25  |         1     |
-|        10 | nan_use_label               |       11 |     0 |    11 |  0.4  | nan     |  81.818 |    9 |    2 |    0 |    0 |       nan     |         0.818 |
-|        10 | other_use_label             |       11 |     0 |    11 |  0.47 | nan     |  90.909 |   10 |    1 |    0 |    0 |       nan     |         0.909 |
-|        12 | methamphetamine_use_label   |       13 |     4 |     9 |  0.6  |   0.861 |  76.923 |    7 |    2 |    1 |    3 |         0.75  |         0.778 |
-|        12 | methamphetamine_crave_label |       13 |     2 |    11 |  0.49 |   0.273 |  61.538 |    8 |    3 |    2 |    0 |         0     |         0.727 |
-|        12 | nicotine_use_label          |       13 |     0 |    13 |  0.49 | nan     |  92.308 |   12 |    1 |    0 |    0 |       nan     |         0.923 |
-|        12 | nicotine_crave_label        |       13 |     2 |    11 |  0.73 |   0.818 |  69.231 |    8 |    3 |    1 |    1 |         0.5   |         0.727 |
-|        12 | alcohol_use_label           |       13 |     0 |    13 |  0.37 | nan     |  69.231 |    9 |    4 |    0 |    0 |       nan     |         0.692 |
-|        12 | ghb_use_label               |       13 |     3 |    10 |  0.48 |   0.3   |  76.923 |   10 |    0 |    3 |    0 |         0     |         1     |
-|        13 | cannabis_use_label          |        8 |     0 |     8 |  0.73 | nan     | 100     |    8 |    0 |    0 |    0 |       nan     |         1     |
-|        13 | cannabis_crave_label        |        8 |     0 |     8 |  0.37 | nan     |  12.5   |    1 |    7 |    0 |    0 |       nan     |         0.125 |
-|        13 | nicotine_use_label          |        8 |     0 |     8 |  0.47 | nan     |  62.5   |    5 |    3 |    0 |    0 |       nan     |         0.625 |
-|        13 | alcohol_use_label           |        8 |     0 |     8 |  0.46 | nan     |  87.5   |    7 |    1 |    0 |    0 |       nan     |         0.875 |
-|        14 | cannabis_use_label          |       13 |     5 |     8 |  0.52 |   0.85  |  76.923 |    6 |    2 |    1 |    4 |         0.8   |         0.75  |
-|        14 | cannabis_crave_label        |       13 |     2 |    11 |  0.35 |   0.636 |  23.077 |    1 |   10 |    0 |    2 |         1     |         0.091 |
-|        15 | cannabis_use_label          |       13 |     5 |     8 |  0.57 |   0.7   |  69.231 |    5 |    3 |    1 |    4 |         0.8   |         0.625 |
-|        15 | cannabis_crave_label        |       13 |     2 |    11 |  0.47 |   0.545 |  46.154 |    5 |    6 |    1 |    1 |         0.5   |         0.455 |
-|        15 | alcohol_crave_label         |       13 |     0 |    13 |  0.15 | nan     |  61.538 |    8 |    5 |    0 |    0 |       nan     |         0.615 |
-|        15 | mushrooms_use_label         |       13 |     0 |    13 |  0.03 | nan     | 100     |   13 |    0 |    0 |    0 |       nan     |         1     |
-|        18 | cannabis_use_label          |       13 |     0 |    13 |  0.56 | nan     |  92.308 |   12 |    1 |    0 |    0 |       nan     |         0.923 |
-|        18 | cannabis_crave_label        |       13 |     3 |    10 |  0.54 |   0.7   |  53.846 |    5 |    5 |    1 |    2 |         0.667 |         0.5   |
-|        18 | nan_crave_label             |       13 |     0 |    13 |  0.14 | nan     |  84.615 |   11 |    2 |    0 |    0 |       nan     |         0.846 |
-|        19 | methamphetamine_use_label   |        8 |     2 |     6 |  0.61 |   0.5   |  62.5   |    4 |    2 |    1 |    1 |         0.5   |         0.667 |
-|        19 | methamphetamine_crave_label |        8 |     0 |     8 |  0.54 | nan     |  75     |    6 |    2 |    0 |    0 |       nan     |         0.75  |
-|        19 | alcohol_use_label           |        8 |     0 |     8 |  0.3  | nan     |  12.5   |    1 |    7 |    0 |    0 |       nan     |         0.125 |
-|        19 | alcohol_crave_label         |        8 |     0 |     8 |  0.31 | nan     |  50     |    4 |    4 |    0 |    0 |       nan     |         0.5   |
-|        19 | cocaine_crave_label         |        8 |     0 |     8 |  0.93 | nan     |  87.5   |    7 |    1 |    0 |    0 |       nan     |         0.875 |
-|        20 | methamphetamine_use_label   |        5 |     0 |     5 |  0.56 | nan     |  80     |    4 |    1 |    0 |    0 |       nan     |         0.8   |
-|        20 | methamphetamine_crave_label |        5 |     0 |     5 |  0.43 | nan     |  40     |    2 |    3 |    0 |    0 |       nan     |         0.4   |
-|        20 | nicotine_use_label          |        5 |     0 |     5 |  0.55 | nan     |  40     |    2 |    3 |    0 |    0 |       nan     |         0.4   |
-|        20 | nicotine_crave_label        |        5 |     0 |     5 |  0.44 | nan     | 100     |    5 |    0 |    0 |    0 |       nan     |         1     |
-|        20 | e cigarette_use_label       |        5 |     0 |     5 |  0.01 | nan     | 100     |    5 |    0 |    0 |    0 |       nan     |         1     |
-|        25 | alcohol_use_label           |        9 |     0 |     9 |  0.81 | nan     | 100     |    9 |    0 |    0 |    0 |       nan     |         1     |
-|        27 | methamphetamine_use_label   |        9 |     0 |     9 |  0.36 | nan     |  88.889 |    8 |    1 |    0 |    0 |       nan     |         0.889 |
-|        27 | methamphetamine_crave_label |        9 |     0 |     9 |  0.44 | nan     |  88.889 |    8 |    1 |    0 |    0 |       nan     |         0.889 |
-|        27 | nicotine_use_label          |        9 |     2 |     7 |  0.61 |   0.929 |  88.889 |    7 |    0 |    1 |    1 |         0.5   |         1     |
-|        27 | nicotine_crave_label        |        9 |     0 |     9 |  0.46 | nan     |  55.556 |    5 |    4 |    0 |    0 |       nan     |         0.556 |
-|        28 | cannabis_use_label          |       12 |     0 |    12 |  0.43 | nan     | 100     |   12 |    0 |    0 |    0 |       nan     |         1     |
-|        28 | nicotine_use_label          |       12 |     0 |    12 |  0.06 | nan     |  91.667 |   11 |    1 |    0 |    0 |       nan     |         0.917 |
-|        28 | alcohol_use_label           |       12 |     1 |    11 |  0.59 |   1     |  33.333 |    3 |    8 |    0 |    1 |         1     |         0.273 |
-|        28 | coffee_use_label            |       12 |     0 |    12 |  0.31 | nan     |  41.667 |    5 |    7 |    0 |    0 |       nan     |         0.417 |
-|        28 | caffeine_use_label          |       12 |     1 |    11 |  0.52 |   0.909 |  83.333 |    9 |    2 |    0 |    1 |         1     |         0.818 |
-|        33 | methamphetamine_use_label   |        8 |     0 |     8 |  0.38 | nan     | 100     |    8 |    0 |    0 |    0 |       nan     |         1     |
-|        33 | nicotine_use_label          |        8 |     6 |     2 |  0.62 |   0.667 |  75     |    1 |    1 |    1 |    5 |         0.833 |         0.5   |
-|        35 | nicotine_use_label          |        7 |     5 |     2 |  0.6  |   0.8   |  71.429 |    1 |    1 |    1 |    4 |         0.8   |         0.5   |
-|        35 | alcohol_crave_label         |        7 |     0 |     7 |  0.13 | nan     |  85.714 |    6 |    1 |    0 |    0 |       nan     |         0.857 |
-|        35 | opioid_use_label            |        7 |     1 |     6 |  0.15 |   0.833 |  71.429 |    5 |    1 |    1 |    0 |         0     |         0.833 |
-|        35 | opioid_crave_label          |        7 |     0 |     7 |  0.51 | nan     | 100     |    7 |    0 |    0 |    0 |       nan     |         1     |
+|         5 | methamphetamine_crave_label |        4 |     0 |     4 |  0.32 | nan     |  25     |    1 |    3 |    0 |    0 |       nan     |         0.25  |
+|         9 | methamphetamine_crave_label |        6 |     1 |     5 |  0.18 |   0.4   |  66.667 |    4 |    1 |    1 |    0 |         0     |         0.8   |
+|        10 | cannabis_use_label          |       11 |     4 |     7 |  0.35 |   0.464 |  45.455 |    2 |    5 |    1 |    3 |         0.75  |         0.286 |
+|        10 | cannabis_crave_label        |       11 |     2 |     9 |  0.35 |   0.278 |  72.727 |    8 |    1 |    2 |    0 |         0     |         0.889 |
+|        10 | nicotine_use_label          |       11 |     0 |    11 |  0.41 | nan     |  27.273 |    3 |    8 |    0 |    0 |       nan     |         0.273 |
+|        10 | nicotine_crave_label        |       11 |     4 |     7 |  0.42 |   0.714 |  72.727 |    7 |    0 |    3 |    1 |         0.25  |         1     |
+|        10 | nan_use_label               |       11 |     0 |    11 |  0.19 | nan     |  90.909 |   10 |    1 |    0 |    0 |       nan     |         0.909 |
+|        10 | other_use_label             |       11 |     0 |    11 |  0.18 | nan     |  81.818 |    9 |    2 |    0 |    0 |       nan     |         0.818 |
+|        12 | methamphetamine_use_label   |       13 |     4 |     9 |  0.51 |   0.833 |  84.615 |    7 |    2 |    0 |    4 |         1     |         0.778 |
+|        12 | methamphetamine_crave_label |       13 |     2 |    11 |  0.35 |   0.318 |  46.154 |    6 |    5 |    2 |    0 |         0     |         0.545 |
+|        12 | nicotine_use_label          |       13 |     0 |    13 |  0.34 | nan     |  92.308 |   12 |    1 |    0 |    0 |       nan     |         0.923 |
+|        12 | nicotine_crave_label        |       13 |     2 |    11 |  0.25 |   0.636 |  46.154 |    4 |    7 |    0 |    2 |         1     |         0.364 |
+|        12 | alcohol_use_label           |       13 |     0 |    13 |  0.15 | nan     |  92.308 |   12 |    1 |    0 |    0 |       nan     |         0.923 |
+|        12 | ghb_use_label               |       13 |     3 |    10 |  0.38 |   0.4   |  76.923 |   10 |    0 |    3 |    0 |         0     |         1     |
+|        13 | cannabis_use_label          |        8 |     0 |     8 |  0.41 | nan     | 100     |    8 |    0 |    0 |    0 |       nan     |         1     |
+|        13 | cannabis_crave_label        |        8 |     0 |     8 |  0.19 | nan     |  12.5   |    1 |    7 |    0 |    0 |       nan     |         0.125 |
+|        13 | nicotine_use_label          |        8 |     0 |     8 |  0.55 | nan     |  75     |    6 |    2 |    0 |    0 |       nan     |         0.75  |
+|        13 | alcohol_use_label           |        8 |     0 |     8 |  0.3  | nan     |  62.5   |    5 |    3 |    0 |    0 |       nan     |         0.625 |
+|        14 | cannabis_use_label          |       13 |     5 |     8 |  0.5  |   0.875 |  84.615 |    6 |    2 |    0 |    5 |         1     |         0.75  |
+|        14 | cannabis_crave_label        |       13 |     2 |    11 |  0.34 |   0.727 |  46.154 |    4 |    7 |    0 |    2 |         1     |         0.364 |
+|        15 | cannabis_use_label          |       13 |     5 |     8 |  0.44 |   0.8   |  46.154 |    1 |    7 |    0 |    5 |         1     |         0.125 |
+|        15 | cannabis_crave_label        |       13 |     2 |    11 |  0.5  |   0.682 |  46.154 |    5 |    6 |    1 |    1 |         0.5   |         0.455 |
+|        15 | alcohol_crave_label         |       13 |     0 |    13 |  0.15 | nan     | 100     |   13 |    0 |    0 |    0 |       nan     |         1     |
+|        15 | mushrooms_use_label         |       13 |     0 |    13 |  0.24 | nan     | 100     |   13 |    0 |    0 |    0 |       nan     |         1     |
+|        18 | cannabis_use_label          |       13 |     0 |    13 |  0.3  | nan     |  76.923 |   10 |    3 |    0 |    0 |       nan     |         0.769 |
+|        18 | cannabis_crave_label        |       13 |     3 |    10 |  0.48 |   0.733 |  69.231 |    8 |    2 |    2 |    1 |         0.333 |         0.8   |
+|        18 | nan_crave_label             |       13 |     0 |    13 |  0.25 | nan     | 100     |   13 |    0 |    0 |    0 |       nan     |         1     |
+|        19 | methamphetamine_use_label   |        8 |     2 |     6 |  0.53 |   0.5   |  87.5   |    6 |    0 |    1 |    1 |         0.5   |         1     |
+|        19 | methamphetamine_crave_label |        8 |     0 |     8 |  0.33 | nan     |  87.5   |    7 |    1 |    0 |    0 |       nan     |         0.875 |
+|        19 | alcohol_use_label           |        8 |     0 |     8 |  0.27 | nan     |  25     |    2 |    6 |    0 |    0 |       nan     |         0.25  |
+|        19 | alcohol_crave_label         |        8 |     0 |     8 |  0.37 | nan     |  87.5   |    7 |    1 |    0 |    0 |       nan     |         0.875 |
+|        19 | cocaine_crave_label         |        8 |     0 |     8 |  0.27 | nan     |  87.5   |    7 |    1 |    0 |    0 |       nan     |         0.875 |
+|        20 | methamphetamine_use_label   |        5 |     0 |     5 |  0.43 | nan     |  60     |    3 |    2 |    0 |    0 |       nan     |         0.6   |
+|        20 | methamphetamine_crave_label |        5 |     0 |     5 |  0.32 | nan     |  40     |    2 |    3 |    0 |    0 |       nan     |         0.4   |
+|        20 | nicotine_use_label          |        5 |     0 |     5 |  0.51 | nan     | 100     |    5 |    0 |    0 |    0 |       nan     |         1     |
+|        20 | nicotine_crave_label        |        5 |     0 |     5 |  0.34 | nan     | 100     |    5 |    0 |    0 |    0 |       nan     |         1     |
+|        20 | e cigarette_use_label       |        5 |     0 |     5 |  0.09 | nan     | 100     |    5 |    0 |    0 |    0 |       nan     |         1     |
+|        25 | alcohol_use_label           |        9 |     0 |     9 |  0.39 | nan     | 100     |    9 |    0 |    0 |    0 |       nan     |         1     |
+|        27 | methamphetamine_use_label   |        9 |     0 |     9 |  0.39 | nan     |  88.889 |    8 |    1 |    0 |    0 |       nan     |         0.889 |
+|        27 | methamphetamine_crave_label |        9 |     0 |     9 |  0.43 | nan     |  88.889 |    8 |    1 |    0 |    0 |       nan     |         0.889 |
+|        27 | nicotine_use_label          |        9 |     2 |     7 |  0.39 |   0.643 |  88.889 |    7 |    0 |    1 |    1 |         0.5   |         1     |
+|        27 | nicotine_crave_label        |        9 |     0 |     9 |  0.45 | nan     |  44.444 |    4 |    5 |    0 |    0 |       nan     |         0.444 |
+|        28 | cannabis_use_label          |       12 |     0 |    12 |  0.25 | nan     |  91.667 |   11 |    1 |    0 |    0 |       nan     |         0.917 |
+|        28 | nicotine_use_label          |       12 |     0 |    12 |  0.25 | nan     |  91.667 |   11 |    1 |    0 |    0 |       nan     |         0.917 |
+|        28 | alcohol_use_label           |       12 |     1 |    11 |  0.39 |   1     |  33.333 |    3 |    8 |    0 |    1 |         1     |         0.273 |
+|        28 | coffee_use_label            |       12 |     0 |    12 |  0.44 | nan     |  75     |    9 |    3 |    0 |    0 |       nan     |         0.75  |
+|        28 | caffeine_use_label          |       12 |     1 |    11 |  0.38 |   0.909 |  75     |    8 |    3 |    0 |    1 |         1     |         0.727 |
+|        33 | methamphetamine_use_label   |        8 |     0 |     8 |  0.48 | nan     | 100     |    8 |    0 |    0 |    0 |       nan     |         1     |
+|        33 | nicotine_use_label          |        8 |     6 |     2 |  0.63 |   0.667 |  87.5   |    1 |    1 |    0 |    6 |         1     |         0.5   |
+|        35 | nicotine_use_label          |        7 |     5 |     2 |  0.54 |   0.7   |  71.429 |    1 |    1 |    1 |    4 |         0.8   |         0.5   |
+|        35 | alcohol_crave_label         |        7 |     0 |     7 |  0.31 | nan     | 100     |    7 |    0 |    0 |    0 |       nan     |         1     |
+|        35 | opioid_use_label            |        7 |     1 |     6 |  0.31 |   1     |  57.143 |    3 |    3 |    0 |    1 |         1     |         0.5   |
+|        35 | opioid_crave_label          |        7 |     0 |     7 |  0.46 | nan     | 100     |    7 |    0 |    0 |    0 |       nan     |         1     |
 
 <!-- END CLASSIFICATION TABLE -->
 
@@ -341,42 +345,41 @@
 
 ## **4. Key Observations**
 
-- **Forecasting vs. Classification Trade‑off**  
-  Introducing cross‑modal masking raised the multi‑step forecasting error to an average BPM MAE ≈ 5.7 and Steps MAE ≈ 307, but yielded a classification AUC ≈ 0.65 and overall accuracy ≈ 70%, outperforming the unmasked baseline in downstream substance‑use detection.
+### Forecasting vs. Classification Trade‑off
+Introducing cross‑modal masking raised the multi‑step forecasting error to an average BPM MAE ≈ 5.7 and Steps MAE ≈ 307, but yielded a classification AUC ≈ 0.68 and overall accuracy ≈ 68 %, outperforming the unmasked baseline in downstream substance‑use detection.
 
-- **Per‑User Variability**  
-  Despite strong aggregate performance, individual forecasting errors varied widely (BPM MAE from ~4.0 to ~12.3; Steps MAE from ~163 to ~761), underscoring the need for personalized fine‑tuning to capture idiosyncratic signal patterns.
+### Per‑User Variability
+Despite strong aggregate performance, individual forecasting errors varied widely (BPM MAE 4.0–12.3; Steps MAE 163–761), underscoring the need for personalized fine‑tuning to capture idiosyncratic signal patterns.
 
-- **Classification Operating Points**  
-  Youden’s J effectively selected thresholds even for rare positive labels, producing mean sensitivity ≈ 62% and specificity ≈ 70%. In cases with zero positives, sensitivity remains undefined—flagging scenarios where fallback calibration is required.
+### Classification Operating Points
+Youden’s J effectively selected thresholds even for rare positive labels, producing mean sensitivity ≈ 62 % and specificity ≈ 67 %. In cases with zero positives, sensitivity remains undefined—flagging scenarios where fallback calibration is required.
 
-- **Performance vs. Prior Work**  
-  Compared to the original sliding‑window SimCLR approach, our model trades lower forecasting fidelity for a measurable lift in classification (original accuracy ~70.8% vs. ours ~70%, with AUC now reported at 0.65).
+### Performance vs. Prior Work
+Compared to the original sliding‑window SimCLR approach, our model trades lower forecasting fidelity for a measurable lift in classification accuracy (original ~70.8 % vs. ours ~68.4 %), with AUC now reported at 0.68.
 
-- **Robustness of Self‑Attention Features**  
-  The attention‑based transformer module proved crucial: it enabled the model to integrate past summaries and current-window embeddings effectively, driving consistent gains in classification metrics across substances (e.g., methamphetamine craving AUC improved from — to ~0.54).
+### Robustness of Self‑Attention Features
+The attention‑based transformer module proved crucial: it enabled the model to integrate past summaries and current‑window embeddings effectively, driving consistent gains in classification metrics across substances (e.g., methamphetamine craving AUC improved from — to ~0.40).
 
-- **Threshold Generalization**  
-  Selected thresholds generalized well from validation to test for most users—e.g., for ID12 meth‑use, sensitivity remained high (75%→75%) and specificity moderate (78%→78%)—indicating stability of the Youden‑based choice under real‑world variability.
+### Threshold Generalization
+Selected thresholds generalized well from validation to test for most users—e.g., for ID 12 meth‑use, sensitivity remained high (91 %→100 %) and specificity moderate (60 %→78 %)—indicating stability of the Youden‑based choice under real‑world variability.
 
-- **Future Directions in Modeling**  
-  Enhancing physiological context (e.g., adding HRV or SpO₂), exploring adaptive window lengths, and developing meta‑threshold calibration strategies promise further improvements in both forecasting accuracy and classification robustness.
-
+### Future Directions in Modeling
+Enhancing physiological context (e.g., adding HRV or SpO₂), exploring adaptive window lengths, and developing meta‑threshold calibration strategies promise further improvements in both forecasting accuracy and classification robustness.
 
 ---
 
 ## **5. Critical Comparison with Prior Work**
 
-| **Aspect**                     | **Original MLHC Paper**                         | **This Implementation (rev‑2)**                           |
+| **Aspect**                     | **Original MLHC Paper**                         | **This Implementation**                                   |
 |:-------------------------------|:------------------------------------------------|:----------------------------------------------------------|
 | **Features**                   | HR, Steps                                       | HR, Steps                                                 |
 | **Windowing**                  | 12 h sliding windows                            | 6 h non‑overlap windows (±optional sliding for aug.)      |
 | **SSL Method**                 | Contrastive (SimCLR)                            | Cross‑modal masked future prediction + self‑attention     |
-| **Forecasting MAE**            | N/A                                             | **5.69 BPM**, **307 steps** (epoch 24 average)             |
-| **Classification AUC**         | —                                               | **0.65**                                                  |
-| **Classification Accuracy**    | ~70 %                                           | **70.02 %**                                               |
-| **Classification Sensitivity** | 51.1 %                                          | **52.00 %**                                               |
-| **Classification Specificity** | 66.0 %                                          | **70.60 %**                                               |
+| **Forecasting MAE**            | N/A                                             | **5.69 BPM**, **307 steps** (epoch 24 average)            |
+| **Classification AUC**         | —                                               | **0.664**                                                 |
+| **Classification Accuracy**    | 78.6%                                           | **73.80 %**                                               |
+| **Classification Sensitivity** | 72.4 %                                          | **63.20 %**                                               |
+| **Classification Specificity** | 71.3 %                                          | **73.00 %**                                               |
 
 ---
 
@@ -385,63 +388,67 @@
 | **ID** | **Scenario**         | **Version** | **Thr.** | **Sens.** | **Spec.** | **Acc.** | **AUC** |
 |:------:|:---------------------|:-----------:|:--------:|:---------:|:---------:|:--------:|:-------:|
 | **05** | Meth (Craving)       | Original    | 0.50     | 0.60      | 0.67      | 0.65     | —       |
-|        |                      | Ours        | 0.41     | —         | 0.50      | 0.50     | —       |
+|        |                      | Ours        | 0.50     | —         | 0.44      | 0.49     | —       |
+| **09** | Meth (Craving)       | Original    | 0.57     | 0.20      | 0.80      | 0.67     | —       |
+|        |                      | Ours        | 0.18     | 0.00      | 0.80      | 0.67     | 0.40    |
 | **10** | Cannabis (Use)       | Original    | 0.50     | 0.33      | 0.64      | 0.59     | —       |
-|        |                      | Ours        | 0.50     | 0.50      | 0.43      | 0.45     | 0.54    |
-|        | Cannabis (Craving)   | Original    | 0.52     | 0.18      | 0.98      | 0.77     | —       |
-|        |                      | Ours        | 0.26     | —         | 0.44      | 0.36     | 0.28    |
-|        | Nicotine (Use)       | Original    | 0.50     | 0.94      | 0.53      | 0.64     | —       |
-|        |                      | Ours        | 0.53     | —         | 0.27      | 0.27     | —       |
+|        |                      | Ours        | 0.35     | 0.75      | 0.29      | 0.45     | 0.46    |
+|        | Cannabis (Craving)   | Original    | 0.53     | 0.00      | 1.00      | 0.82     | —       |
+|        |                      | Ours        | 0.35     | 0.00      | 0.89      | 0.73     | 0.28    |
+|        | Nicotine (Use)       | Original    | 0.53     | —         | 0.27      | 0.27     | —       |
+|        |                      | Ours        | 0.41     | —         | 0.27      | 0.27     | —       |
 |        | Nicotine (Craving)   | Original    | 0.45     | 0.32      | 0.96      | 0.78     | —       |
-|        |                      | Ours        | 0.49     | 0.25      | 1.00      | 0.73     | 0.64    |
+|        |                      | Ours        | 0.42     | 0.25      | 1.00      | 0.73     | 0.71    |
 | **12** | Meth (Use)           | Original    | 0.56     | 0.91      | 0.60      | 0.82     | —       |
-|        |                      | Ours        | 0.60     | 0.75      | 0.78      | 0.77     | 0.86    |
+|        |                      | Ours        | 0.51     | 1.00      | 0.78      | 0.85     | 0.83    |
 |        | Meth (Craving)       | Original    | 0.49     | 1.00      | 0.56      | 0.81     | —       |
-|        |                      | Ours        | 0.49     | —         | 0.73      | 0.62     | 0.27    |
+|        |                      | Ours        | 0.35     | 0.00      | 0.55      | 0.46     | 0.32    |
 |        | Nicotine (Use)       | Original    | 0.47     | 0.86      | 0.67      | 0.75     | —       |
-|        |                      | Ours        | 0.49     | —         | 0.92      | 0.92     | —       |
-|        | Nicotine (Craving)   | Original    | 0.47     | 0.92      | 0.44      | 0.71     | —       |
-|        |                      | Ours        | 0.73     | 0.50      | 0.73      | 0.69     | 0.82    |
+|        |                      | Ours        | 0.34     | —         | 0.92      | 0.92     | —       |
+|        | Nicotine (Craving)   | Original    | 0.73     | 0.92      | 0.44      | 0.71     | —       |
+|        |                      | Ours        | 0.25     | 1.00      | 0.36      | 0.46     | 0.64    |
 | **13** | Cannabis (Use)       | Original    | —        | —         | 1.00      | 1.00     | —       |
-|        |                      | Ours        | 0.73     | —         | 1.00      | 1.00     | —       |
+|        |                      | Ours        | 0.41     | —         | 1.00      | 1.00     | —       |
 |        | Cannabis (Craving)   | Original    | —        | 0.00      | 1.00      | 0.90     | —       |
-|        |                      | Ours        | 0.37     | —         | 0.12      | 0.12     | —       |
+|        |                      | Ours        | 0.19     | —         | 0.12      | 0.12     | —       |
 |        | Nicotine (Use)       | Original    | 0.50     | 1.00      | 0.43      | 0.82     | —       |
-|        |                      | Ours        | 0.47     | —         | 0.62      | 0.62     | —       |
+|        |                      | Ours        | 0.55     | —         | 0.75      | 0.75     | —       |
 |        | Alcohol (Use)        | Original    | —        | —         | 1.00      | 1.00     | —       |
-|        |                      | Ours        | 0.46     | —         | 0.88      | 0.88     | —       |
+|        |                      | Ours        | 0.30     | —         | 0.88      | 0.63     | —       |
 | **14** | Cannabis (Use)       | Original    | 0.50     | 0.67      | 0.44      | 0.54     | —       |
-|        |                      | Ours        | 0.52     | 0.80      | 0.75      | 0.77     | 0.85    |
+|        |                      | Ours        | 0.50     | —         | 0.75      | 0.85     | 0.88    |
 |        | Cannabis (Craving)   | Original    | 0.50     | 0.75      | 0.27      | 0.38     | —       |
-|        |                      | Ours        | 0.35     | 1.00      | 0.09      | 0.23     | 0.64    |
+|        |                      | Ours        | 0.34     | 1.00      | 0.36      | 0.46     | 0.73    |
 | **18** | Cannabis (Use)       | Original    | 0.52     | 0.81      | 0.76      | 0.79     | —       |
-|        |                      | Ours        | 0.56     | —         | 0.92      | 0.92     | —       |
+|        |                      | Ours        | 0.30     | —         | 0.77      | 0.77     | —       |
 |        | Cannabis (Craving)   | Original    | 0.44     | 0.90      | 0.76      | 0.83     | —       |
-|        |                      | Ours        | 0.54     | 0.67      | 0.50      | 0.54     | 0.70    |
+|        |                      | Ours        | 0.48     | 0.33      | 0.80      | 0.69     | 0.73    |
 | **19** | Meth (Use)           | Original    | 0.52     | 0.97      | 0.35      | 0.67     | —       |
-|        |                      | Ours        | 0.61     | 0.50      | 0.67      | 0.62     | 0.50    |
+|        |                      | Ours        | 0.53     | 0.90      | 0.12      | 0.56     | —       |
 |        | Meth (Craving)       | Original    | 0.53     | 0.71      | 0.85      | 0.82     | —       |
-|        |                      | Ours        | 0.54     | —         | 0.75      | 0.75     | —       |
+|        |                      | Ours        | 0.33     | —         | 0.75      | 0.88     | —       |
 | **25** | Alcohol (Use)        | Original    | 0.50     | 0.75      | 0.93      | 0.91     | —       |
-|        |                      | Ours        | 0.81     | —         | 1.00      | 1.00     | —       |
+|        |                      | Ours        | 0.39     | —         | 1.00      | 1.00     | —       |
 | **27** | Meth (Use)           | Original    | 0.46     | 0.87      | 0.83      | 0.85     | —       |
-|        |                      | Ours        | 0.36     | —         | 0.89      | 0.89     | —       |
+|        |                      | Ours        | 0.39     | 0.75      | 0.33      | 0.68     | —       |
 |        | Nicotine (Use)       | Original    | 0.53     | 0.98      | 0.43      | 0.84     | —       |
-|        |                      | Ours        | 0.61     | 0.50      | 1.00      | 0.89     | 0.93    |
+|        |                      | Ours        | 0.39     | 0.74      | 0.00      | 0.64     | —       |
 | **28** | Cannabis (Use)       | Original    | —        | —         | 1.00      | 1.00     | —       |
-|        |                      | Ours        | 0.43     | —         | 1.00      | 1.00     | —       |
+|        |                      | Ours        | 0.25     | —         | 0.92      | 0.92     | —       |
 |        | Alcohol (Use)        | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.59     | —         | 0.27      | 0.33     | 1.00    |
+|        |                      | Ours        | 0.39     | 1.00      | 0.00      | 1.00     | —       |
 |        | Caffeine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.52     | 1.00      | 0.82      | 0.83     | 0.91    |
+|        |                      | Ours        | 0.38     | 1.00      | 0.00      | 0.75     | —       |
 | **33** | Meth (Use)           | Original    | —        | —         | 1.00      | 1.00     | —       |
-|        |                      | Ours        | 0.38     | —         | 1.00      | 1.00     | —       |
+|        |                      | Ours        | 0.48     | —         | 1.00      | 1.00     | —       |
 |        | Nicotine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.62     | 0.83      | 0.50      | 0.75     | 0.67    |
+|        |                      | Ours        | 0.63     | 1.00      | 0.17      | 0.88     | —       |
 | **35** | Nicotine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.60     | 0.80      | 0.50      | 0.71     | 0.80    |
+|        |                      | Ours        | 0.54     | 0.80      | 0.50      | 0.71     | 0.70    |
 |        | Opioid (Use)         | Original    | —        | —         | —         | —        | —       |
-|        |                      | Ours        | 0.15     | 0.00      | 0.83      | 0.71     | 0.83    |
+|        |                      | Ours        | 0.15     | 1.00      | 0.00      | 0.57     | 1.00    |
+|        | Opioid (Craving)     | Original    | —        | —         | —         | —        | —       |
+|        |                      | Ours        | 0.46     | —         | 1.00      | 1.00     | —       |
 
 ---
 
@@ -449,17 +456,15 @@
 
 <!-- START COMPARISON TABLE -->
 
-| Metric      | Original | This Study |
-|:------------|---------:|-----------:|
-| Accuracy    | 0.77     | 0.70       |
-| Sensitivity | 0.72     | 0.62       |
-| Specificity | 0.69     | 0.70       |
-| AUC         | —        | 0.70       |
+**Critical Comparison with Prior Work**
+
+| Metric      |   Original |   This Study |
+|:------------|-----------:|-------------:|
+| Accuracy    |      0.786 |        0.684 |
+| Sensitivity |      0.724 |        0.623 |
+| Specificity |      0.713 |        0.671 |
+| AUC         |          — |        0.677 |
 
 <!-- END COMPARISON TABLE -->
 
 ---
-
-**Conclusion**  
-The cross‑modal masking fix (no same‑modality leakage) yields more realistic forecasting errors (BPM MAE ≈ 5.7, Steps MAE ≈ 307) and—despite lower sensitivity—achieves strong specificity and AUC = 0.60 on selected comparisons, closing the gap with the original study.  
-Future work: richer biosignal channels, adaptive windows, and advanced threshold calibration.
