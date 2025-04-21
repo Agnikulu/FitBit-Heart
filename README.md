@@ -102,9 +102,10 @@
   - Sigmoid‑based binary output.  
 - **Fine‑Tuning**:  
   - Unfreeze the **last 30%** of backbone layers (the deepest CNN+GRU blocks).
-- **Why No Attention?**  
+- **Why No Attention Across Windows?**  
   - Each input is just a single 6 h block (a 1×6 sequence of two signals): our CNN+GRU captures those six time‑step patterns effectively.  
   - The SSL forecasting task, by contrast, must fuse a “past” summary plus multiple “current” windows (several 6 h chunks) simultaneously—an inherently multi‑token scenario that benefits from self‑attention.  
+  - Only have attention in single 6 h block to find which moments of block has spikes.
 - **Handling Class Imbalance**:  
   - **Focal Loss** (γ=2.0) replaces BCE to focus on rare positives.  
   - **Sliding‑window augmentation (train only)** When positive labels (e.g. “crave”) are very rare, we **augment positives** by switching from non‑overlapping 6 h blocks to an **overlapping sliding‑window** during **training only**:  
