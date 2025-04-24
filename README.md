@@ -377,10 +377,10 @@ Enhancing physiological context (e.g., adding HRV or SpO₂), exploring adaptive
 | **Windowing**                  | 12 h sliding windows                            | 6 h non‑overlap windows (±optional sliding for aug.)      |
 | **SSL Method**                 | Contrastive (SimCLR)                            | Cross‑modal masked future prediction + self‑attention     |
 | **Forecasting MAE**            | N/A                                             | **5.69 BPM**, **307 steps** (epoch 24 average)            |
-| **Classification AUC**         | —                                               | **0.664**                                                 |
-| **Classification Accuracy**    | 78.6%                                           | **73.80 %**                                               |
-| **Classification Sensitivity** | 72.4 %                                          | **63.20 %**                                               |
-| **Classification Specificity** | 71.3 %                                          | **73.00 %**                                               |
+| **Classification AUC**         | —                                               | **0.66**                                                 |
+| **Classification Accuracy**    | 78.6%                                           | **73.69 %**                                               |
+| **Classification Sensitivity** | 72.4 %                                          | **68.42 %**                                               |
+| **Classification Specificity** | 71.3 %                                          | **74.35 %**                                               |
 
 ---
 
@@ -389,66 +389,66 @@ Enhancing physiological context (e.g., adding HRV or SpO₂), exploring adaptive
 | **ID** | **Scenario**         | **Version** | **Thr.** | **Sens.** | **Spec.** | **Acc.** | **AUC** |
 |:------:|:---------------------|:-----------:|:--------:|:---------:|:---------:|:--------:|:-------:|
 | **05** | Meth (Craving)       | Original    | 0.50     | 0.60      | 0.67      | 0.65     | —       |
-|        |                      | Ours        | 0.50     | —         | 0.44      | 0.49     | —       |
+|        |                      | Ours        | 0.32     | —         | 0.25      | 0.25     | —       |
 | **09** | Meth (Craving)       | Original    | 0.57     | 0.20      | 0.80      | 0.67     | —       |
 |        |                      | Ours        | 0.18     | 0.00      | 0.80      | 0.67     | 0.40    |
 | **10** | Cannabis (Use)       | Original    | 0.50     | 0.33      | 0.64      | 0.59     | —       |
 |        |                      | Ours        | 0.35     | 0.75      | 0.29      | 0.45     | 0.46    |
-|        | Cannabis (Craving)   | Original    | 0.53     | 0.00      | 1.00      | 0.82     | —       |
+| **10** | Cannabis (Craving)   | Original    | 0.53     | 0.00      | 1.00      | 0.82     | —       |
 |        |                      | Ours        | 0.35     | 0.00      | 0.89      | 0.73     | 0.28    |
-|        | Nicotine (Use)       | Original    | 0.53     | —         | 0.27      | 0.27     | —       |
+| **10** | Nicotine (Use)       | Original    | 0.53     | —         | 0.27      | 0.27     | —       |
 |        |                      | Ours        | 0.41     | —         | 0.27      | 0.27     | —       |
-|        | Nicotine (Craving)   | Original    | 0.45     | 0.32      | 0.96      | 0.78     | —       |
+| **10** | Nicotine (Craving)   | Original    | 0.45     | 0.32      | 0.96      | 0.78     | —       |
 |        |                      | Ours        | 0.42     | 0.25      | 1.00      | 0.73     | 0.71    |
 | **12** | Meth (Use)           | Original    | 0.56     | 0.91      | 0.60      | 0.82     | —       |
 |        |                      | Ours        | 0.51     | 1.00      | 0.78      | 0.85     | 0.83    |
-|        | Meth (Craving)       | Original    | 0.49     | 1.00      | 0.56      | 0.81     | —       |
+| **12** | Meth (Craving)       | Original    | 0.49     | 1.00      | 0.56      | 0.81     | —       |
 |        |                      | Ours        | 0.35     | 0.00      | 0.55      | 0.46     | 0.32    |
-|        | Nicotine (Use)       | Original    | 0.47     | 0.86      | 0.67      | 0.75     | —       |
+| **12** | Nicotine (Use)       | Original    | 0.47     | 0.86      | 0.67      | 0.75     | —       |
 |        |                      | Ours        | 0.34     | —         | 0.92      | 0.92     | —       |
-|        | Nicotine (Craving)   | Original    | 0.73     | 0.92      | 0.44      | 0.71     | —       |
+| **12** | Nicotine (Craving)   | Original    | 0.73     | 0.92      | 0.44      | 0.71     | —       |
 |        |                      | Ours        | 0.25     | 1.00      | 0.36      | 0.46     | 0.64    |
 | **13** | Cannabis (Use)       | Original    | —        | —         | 1.00      | 1.00     | —       |
 |        |                      | Ours        | 0.41     | —         | 1.00      | 1.00     | —       |
-|        | Cannabis (Craving)   | Original    | —        | 0.00      | 1.00      | 0.90     | —       |
+| **13** | Cannabis (Craving)   | Original    | —        | 0.00      | 1.00      | 0.90     | —       |
 |        |                      | Ours        | 0.19     | —         | 0.12      | 0.12     | —       |
-|        | Nicotine (Use)       | Original    | 0.50     | 1.00      | 0.43      | 0.82     | —       |
+| **13** | Nicotine (Use)       | Original    | 0.50     | 1.00      | 0.43      | 0.82     | —       |
 |        |                      | Ours        | 0.55     | —         | 0.75      | 0.75     | —       |
-|        | Alcohol (Use)        | Original    | —        | —         | 1.00      | 1.00     | —       |
-|        |                      | Ours        | 0.30     | —         | 0.88      | 0.63     | —       |
+| **13** | Alcohol (Use)        | Original    | —        | —         | 1.00      | 1.00     | —       |
+|        |                      | Ours        | 0.15     | —         | 0.92      | 1.00     | —       |
 | **14** | Cannabis (Use)       | Original    | 0.50     | 0.67      | 0.44      | 0.54     | —       |
 |        |                      | Ours        | 0.50     | —         | 0.75      | 0.85     | 0.88    |
-|        | Cannabis (Craving)   | Original    | 0.50     | 0.75      | 0.27      | 0.38     | —       |
+| **14** | Cannabis (Craving)   | Original    | 0.50     | 0.75      | 0.27      | 0.38     | —       |
 |        |                      | Ours        | 0.34     | 1.00      | 0.36      | 0.46     | 0.73    |
 | **18** | Cannabis (Use)       | Original    | 0.52     | 0.81      | 0.76      | 0.79     | —       |
 |        |                      | Ours        | 0.30     | —         | 0.77      | 0.77     | —       |
-|        | Cannabis (Craving)   | Original    | 0.44     | 0.90      | 0.76      | 0.83     | —       |
+| **18** | Cannabis (Craving)   | Original    | 0.44     | 0.90      | 0.76      | 0.83     | —       |
 |        |                      | Ours        | 0.48     | 0.33      | 0.80      | 0.69     | 0.73    |
 | **19** | Meth (Use)           | Original    | 0.52     | 0.97      | 0.35      | 0.67     | —       |
-|        |                      | Ours        | 0.53     | 0.90      | 0.12      | 0.56     | —       |
-|        | Meth (Craving)       | Original    | 0.53     | 0.71      | 0.85      | 0.82     | —       |
-|        |                      | Ours        | 0.33     | —         | 0.75      | 0.88     | —       |
+|        |                      | Ours        | 0.53     | 0.50      | 1.00      | 0.88     | 0.50    |
+| **19** | Meth (Craving)       | Original    | 0.53     | 0.71      | 0.85      | 0.82     | —       |
+|        |                      | Ours        | 0.33     | —         | 0.88      | 0.88     | —       |
 | **25** | Alcohol (Use)        | Original    | 0.50     | 0.75      | 0.93      | 0.91     | —       |
 |        |                      | Ours        | 0.39     | —         | 1.00      | 1.00     | —       |
 | **27** | Meth (Use)           | Original    | 0.46     | 0.87      | 0.83      | 0.85     | —       |
-|        |                      | Ours        | 0.39     | 0.75      | 0.33      | 0.68     | —       |
-|        | Nicotine (Use)       | Original    | 0.53     | 0.98      | 0.43      | 0.84     | —       |
-|        |                      | Ours        | 0.39     | 0.74      | 0.00      | 0.64     | —       |
+|        |                      | Ours        | 0.39     | 0.00      | 0.89      | 0.89     | —       |
+| **27** | Nicotine (Use)       | Original    | 0.53     | 0.98      | 0.43      | 0.84     | —       |
+|        |                      | Ours        | 0.39     | 0.50      | 1.00      | 0.78     | 0.64    |
 | **28** | Cannabis (Use)       | Original    | —        | —         | 1.00      | 1.00     | —       |
 |        |                      | Ours        | 0.25     | —         | 0.92      | 0.92     | —       |
-|        | Alcohol (Use)        | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.39     | 1.00      | 0.00      | 1.00     | —       |
-|        | Caffeine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.38     | 1.00      | 0.00      | 0.75     | —       |
+| **28** | Alcohol (Use)        | Original    | 0.50     | —         | —         | —        | —       |
+|        |                      | Ours        | 0.39     | 1.00      | 0.27      | 0.33     | 1.00    |
+| **28** | Caffeine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
+|        |                      | Ours        | 0.38     | 1.00      | 0.73      | 0.75     | 0.91    |
 | **33** | Meth (Use)           | Original    | —        | —         | 1.00      | 1.00     | —       |
 |        |                      | Ours        | 0.48     | —         | 1.00      | 1.00     | —       |
-|        | Nicotine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
-|        |                      | Ours        | 0.63     | 1.00      | 0.17      | 0.88     | —       |
+| **33** | Nicotine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
+|        |                      | Ours        | 0.63     | 1.00      | 0.50      | 0.88     | 0.67    |
 | **35** | Nicotine (Use)       | Original    | 0.50     | —         | —         | —        | —       |
 |        |                      | Ours        | 0.54     | 0.80      | 0.50      | 0.71     | 0.70    |
-|        | Opioid (Use)         | Original    | —        | —         | —         | —        | —       |
-|        |                      | Ours        | 0.15     | 1.00      | 0.00      | 0.57     | 1.00    |
-|        | Opioid (Craving)     | Original    | —        | —         | —         | —        | —       |
+| **35** | Opioid (Use)         | Original    | —        | —         | —         | —        | —       |
+|        |                      | Ours        | 0.31     | 1.00      | 0.50      | 0.57     | 1.00    |
+| **35** | Opioid (Craving)     | Original    | —        | —         | —         | —        | —       |
 |        |                      | Ours        | 0.46     | —         | 1.00      | 1.00     | —       |
 
 ---
@@ -461,10 +461,10 @@ Enhancing physiological context (e.g., adding HRV or SpO₂), exploring adaptive
 
 | Metric      |   Original |   This Study |
 |:------------|-----------:|-------------:|
-| Accuracy    |      0.786 |        0.684 |
-| Sensitivity |      0.724 |        0.623 |
-| Specificity |      0.713 |        0.671 |
-| AUC         |          — |        0.677 |
+| Accuracy    |      0.786 |        0.702 |
+| Sensitivity |      0.724 |        0.655 |
+| Specificity |      0.713 |        0.693 |
+| AUC         |    nan     |        0.671 |
 
 <!-- END COMPARISON TABLE -->
 

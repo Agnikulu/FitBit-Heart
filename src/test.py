@@ -306,7 +306,7 @@ def main():
 
     # comparison metrics
     df_res = pd.DataFrame(all_results)
-    comp_orig = {'Accuracy': 0.708, 'Sensitivity': 0.511, 'Specificity': 0.660, 'AUC': np.nan}
+    comp_orig = {'Accuracy': 0.786, 'Sensitivity': 0.724, 'Specificity': 0.713, 'AUC': np.nan}
     comp_new = {
         'Accuracy': df_res['acc'].mean() / 100,
         'Sensitivity': df_res['sensitivity'].mean(),
